@@ -1,0 +1,32 @@
+[package]
+name = "kafkax"
+version = "0.1.0"
+edition = "2021"
+description = "高性能 Kafka 桌面客户端"
+
+[dependencies]
+iced = { version = "0.13", features = ["tokio"] }
+rdkafka = { version = "0.36", features = ["ssl", "zstd", "libz"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+prost = "0.13"
+prost-types = "0.13"
+apache-avro = "0.17"
+rmp-serde = "1"
+chardetng = "0.1"
+encoding_rs = "0.8"
+toml = "0.8"
+directories = "5"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+anyhow = "1"
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
