@@ -1,61 +1,62 @@
-use iced::widget::{button, column, container, row, scrollable, text};
+use iced::widget::{button, column, container, rich_text, row, scrollable, text};
 use iced::{Background, Border, Color, Element, Length, Theme};
 
+use crate::kafka::types::DecodedMessage;
 use crate::message::Message;
 use crate::state::TableState;
 use crate::theme::AppColors;
+use crate::ui::syntax;
 
 /// 渲染消息列表表格
 pub fn view(state: &TableState) -> Element<'_, Message> {
-    let mut content = column![].spacing(0);
+    let mut content = column![table_header()].spacing(8);
 
-    // 表头
-    let header = container(
-        row![
-            cell_text("Offset".to_string(), 80, AppColors::TEXT_SECONDARY),
-            cell_text("Timestamp".to_string(), 150, AppColors::TEXT_SECONDARY),
-            cell_text("Key".to_string(), 120, AppColors::TEXT_SECONDARY),
-            text("Value").size(12).color(AppColors::TEXT_SECONDARY),
-        ]
-        .spacing(8)
-        .padding([6, 12]),
-    )
-    .width(Length::Fill)
-    .style(|_theme: &Theme| container::Style {
-        background: Some(Background::Color(AppColors::BG_TERTIARY)),
-        border: Border {
-            color: AppColors::BORDER,
-            width: 1.0,
-            radius: 0.0.into(),
-        },
-        ..Default::default()
-    });
-
-    content = content.push(header);
+    if let Some(error) = &state.error_message {
+        content = content.push(feedback_banner(
+            error,
+            AppColors::ERROR,
+            AppColors::ERROR_BG,
+        ));
+    }
 
     if state.loading {
-        content = content.push(
-            container(text("加载中...").size(14).color(AppColors::TEXT_MUTED))
-                .padding(20)
-                .width(Length::Fill)
-                .center_x(Length::Fill),
-        );
-    } else if state.messages.is_empty() {
-        content = content.push(
-            container(
-                text("暂无消息数据，请从侧边栏选择一个 Partition")
-                    .size(14)
-                    .color(AppColors::TEXT_MUTED),
+        let (title, subtitle) = if state.search_in_progress {
+            (
+                "正在搜索消息...",
+                "正在扫描当前 Topic 全部分区中仍保留的数据，已消费过但尚未删除的消息也会被检索。",
             )
-            .padding(40)
-            .width(Length::Fill)
-            .center_x(Length::Fill),
-        );
+        } else {
+            ("正在加载消息...", "请稍候，当前分区的数据正在拉取和解码。")
+        };
+        content = content.push(empty_state(title, subtitle));
+    } else if state.messages.is_empty() {
+        let (title, subtitle) = if state.error_message.is_some() {
+            (
+                if state.has_search_results() {
+                    "消息搜索失败"
+                } else {
+                    "消息加载失败"
+                },
+                if state.has_search_results() {
+                    "请检查连接状态、权限配置，或确认当前 Topic 的全部 Partition 是否可读。"
+                } else {
+                    "请检查连接状态、权限配置或当前 Partition 是否可读。"
+                },
+            )
+        } else if state.has_search_results() {
+            (
+                "没有匹配消息",
+                "当前 Topic 全部分区中仍保留的数据里，没有包含该关键字的消息。",
+            )
+        } else {
+            (
+                "暂无消息",
+                "从左侧选择一个 Partition，或确认当前分区是否已有数据。",
+            )
+        };
+        content = content.push(empty_state(title, subtitle));
     } else {
-        let search_query = &state.search_query;
-        let has_search = !search_query.is_empty();
-        let search_lower = search_query.to_lowercase();
-
+        let search_query = state.search_query.trim();
         let rows = column(
             state
                 .messages
@@ -63,55 +64,68 @@ pub fn view(state: &TableState) -> Element<'_, Message> {
                 .enumerate()
                 .map(|(idx, msg)| {
                     let is_selected = state.selected_index == Some(idx);
-
-                    let offset_str = format!("{}", msg.raw.offset);
+                    let partition_str = format!("P-{}", msg.raw.partition);
+                    let offset_str = msg.raw.offset.to_string();
                     let ts_str = msg
                         .raw
                         .timestamp
                         .map(|ts| ts.format("%m-%d %H:%M:%S").to_string())
                         .unwrap_or_else(|| "-".to_string());
-                    let key_str = msg
-                        .decoded_key
-                        .as_deref()
-                        .unwrap_or("-")
-                        .to_string();
-                    let value_str = msg.decoded_value.summary(200);
-
-                    // 搜索匹配检测
-                    let is_match = if has_search {
-                        key_str.to_lowercase().contains(&search_lower)
-                            || value_str.to_lowercase().contains(&search_lower)
-                            || offset_str.contains(&search_lower)
-                    } else {
-                        false
-                    };
+                    let key_str = msg.decoded_key.as_deref().unwrap_or("-").to_string();
+                    let value_str = value_summary(msg, search_query, 200);
 
                     let bg_color = if is_selected {
                         AppColors::ROW_SELECTED
-                    } else if is_match {
-                        // 搜索匹配行用微弱高亮
-                        Color::from_rgb(0.20, 0.28, 0.18)
                     } else if idx % 2 == 0 {
                         AppColors::BG_PRIMARY
                     } else {
                         AppColors::BG_SECONDARY
                     };
 
-                    let value_color = if is_match && !is_selected {
-                        AppColors::WARNING
-                    } else {
-                        AppColors::TEXT_PRIMARY
-                    };
-
                     button(
                         row![
-                            cell_text(offset_str, 80, AppColors::TEXT_MUTED),
-                            cell_text(ts_str, 150, AppColors::TEXT_SECONDARY),
-                            cell_text(key_str, 120, AppColors::ACCENT),
-                            text(value_str).size(12).color(value_color),
+                            cell_rich_text(
+                                syntax::highlight_search(
+                                    &partition_str,
+                                    search_query,
+                                    AppColors::TEXT_MUTED,
+                                ),
+                                72,
+                            ),
+                            cell_rich_text(
+                                syntax::highlight_search(
+                                    &offset_str,
+                                    search_query,
+                                    AppColors::TEXT_MUTED,
+                                ),
+                                80,
+                            ),
+                            cell_rich_text(
+                                syntax::highlight_search(
+                                    &ts_str,
+                                    search_query,
+                                    AppColors::TEXT_SECONDARY,
+                                ),
+                                150,
+                            ),
+                            cell_rich_text(
+                                syntax::highlight_search(
+                                    &key_str,
+                                    search_query,
+                                    AppColors::ACCENT,
+                                ),
+                                120,
+                            ),
+                            rich_text(syntax::highlight_search(
+                                &value_str,
+                                search_query,
+                                AppColors::TEXT_PRIMARY,
+                            ))
+                            .size(12)
+                            .width(Length::Fill),
                         ]
                         .spacing(8)
-                        .padding([4, 12]),
+                        .padding([6, 12]),
                     )
                     .on_press(Message::SelectMessage(idx))
                     .style(move |_theme: &Theme, status| {
@@ -136,43 +150,130 @@ pub fn view(state: &TableState) -> Element<'_, Message> {
 
         content = content.push(scrollable(rows).height(Length::Fill));
 
-        // 搜索结果统计
-        if has_search {
-            let match_count = state
-                .messages
-                .iter()
-                .filter(|msg| {
-                    let key = msg.decoded_key.as_deref().unwrap_or("");
-                    let value = msg.decoded_value.summary(200);
-                    key.to_lowercase().contains(&search_lower)
-                        || value.to_lowercase().contains(&search_lower)
-                })
-                .count();
-
-            content = content.push(
-                container(
-                    text(format!("搜索 \"{}\" - 匹配 {} 条", search_query, match_count))
-                        .size(11)
-                        .color(AppColors::TEXT_SECONDARY),
-                )
-                .padding([4, 12])
-                .width(Length::Fill)
-                .style(|_theme: &Theme| container::Style {
-                    background: Some(Background::Color(AppColors::BG_TERTIARY)),
-                    ..Default::default()
-                }),
-            );
+        if state.has_search_results() {
+            content = content.push(feedback_banner(
+                format!(
+                    "已扫描 {} 条，命中 {} 条。结果覆盖当前 Topic 的全部分区；翻页仅在搜索命中结果内切换。",
+                    state.search_scanned_messages.unwrap_or(0),
+                    state.total_messages
+                ),
+                AppColors::TEXT_SECONDARY,
+                AppColors::BG_TERTIARY,
+            ));
+        } else if !search_query.is_empty() {
+            content = content.push(feedback_banner(
+                format!(
+                    "已输入“{}”。按回车执行当前 Topic 全部分区搜索；未执行前仅对当前页做关键词高亮。",
+                    search_query
+                ),
+                AppColors::TEXT_SECONDARY,
+                AppColors::BG_TERTIARY,
+            ));
         }
     }
 
     container(content)
         .width(Length::Fill)
         .height(Length::Fill)
+        .padding(12)
+        .style(|_theme: &Theme| container::Style {
+            background: Some(Background::Color(AppColors::BG_SECONDARY)),
+            border: Border {
+                color: AppColors::BORDER,
+                width: 1.0,
+                radius: 12.0.into(),
+            },
+            ..Default::default()
+        })
         .into()
 }
 
-fn cell_text(value: String, width: u16, color: Color) -> Element<'static, Message> {
+fn table_header() -> Element<'static, Message> {
+    container(
+        row![
+            cell_text("分区", 72, AppColors::TEXT_SECONDARY),
+            cell_text("Offset", 80, AppColors::TEXT_SECONDARY),
+            cell_text("时间", 150, AppColors::TEXT_SECONDARY),
+            cell_text("Key", 120, AppColors::TEXT_SECONDARY),
+            text("消息摘要").size(12).color(AppColors::TEXT_SECONDARY),
+        ]
+        .spacing(8)
+        .padding([8, 12]),
+    )
+    .width(Length::Fill)
+    .style(|_theme: &Theme| container::Style {
+        background: Some(Background::Color(AppColors::BG_TERTIARY)),
+        border: Border {
+            color: AppColors::BORDER,
+            width: 1.0,
+            radius: 10.0.into(),
+        },
+        ..Default::default()
+    })
+    .into()
+}
+
+fn empty_state<'a>(title: &'a str, subtitle: &'a str) -> Element<'a, Message> {
+    container(
+        column![
+            text(title).size(15).color(AppColors::TEXT_PRIMARY),
+            text(subtitle).size(12).color(AppColors::TEXT_MUTED),
+        ]
+        .spacing(6),
+    )
+    .padding(28)
+    .width(Length::Fill)
+    .style(|_theme: &Theme| container::Style {
+        background: Some(Background::Color(AppColors::BG_PRIMARY)),
+        border: Border {
+            color: AppColors::BORDER,
+            width: 1.0,
+            radius: 10.0.into(),
+        },
+        ..Default::default()
+    })
+    .into()
+}
+
+fn feedback_banner(
+    message: impl Into<String>,
+    text_color: Color,
+    background: Color,
+) -> Element<'static, Message> {
+    container(text(message.into()).size(11).color(text_color))
+        .padding([8, 12])
+        .width(Length::Fill)
+        .style(move |_theme: &Theme| container::Style {
+            background: Some(Background::Color(background)),
+            border: Border {
+                color: background,
+                width: 1.0,
+                radius: 10.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
+fn value_summary(msg: &DecodedMessage, query: &str, max_len: usize) -> String {
+    if query.is_empty() {
+        msg.decoded_value.summary(max_len)
+    } else {
+        syntax::excerpt_for_search(&msg.decoded_value.full_display(), query, max_len)
+    }
+}
+
+fn cell_text(value: &'static str, width: u16, color: Color) -> Element<'static, Message> {
     container(text(value).size(12).color(color))
-        .width(width)
+        .width(u32::from(width))
+        .into()
+}
+
+fn cell_rich_text(
+    spans: Vec<iced::widget::text::Span<'static>>,
+    width: u16,
+) -> Element<'static, Message> {
+    container(rich_text(spans).size(12))
+        .width(u32::from(width))
         .into()
 }

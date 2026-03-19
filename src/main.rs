@@ -3,6 +3,7 @@
 mod app;
 
 use app::App;
+use kafkax::theme;
 
 fn main() -> iced::Result {
     // 初始化日志
@@ -15,10 +16,13 @@ fn main() -> iced::Result {
 
     tracing::info!("KafkaX 启动中...");
 
-    iced::application("KafkaX", App::update, App::view)
+    iced::application(App::new, App::update, App::view)
+        .title(App::title)
         .theme(App::theme)
         .subscription(App::subscription)
+        .default_font(theme::ui_font())
+        .antialiasing(true)
         .window_size((1200.0, 800.0))
         .centered()
-        .run_with(App::new)
+        .run()
 }

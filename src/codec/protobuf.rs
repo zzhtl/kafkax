@@ -145,7 +145,9 @@ fn format_fields(fields: &[Field], indent: usize) -> String {
             WireValue::LengthDelimited(data) => {
                 // 尝试解释为 UTF-8 字符串
                 if let Ok(s) = std::str::from_utf8(data) {
-                    if s.chars().all(|c| !c.is_control() || c == '\n' || c == '\r' || c == '\t') {
+                    if s.chars()
+                        .all(|c| !c.is_control() || c == '\n' || c == '\r' || c == '\t')
+                    {
                         result.push_str(&format!("\"{}\"", s));
                     } else {
                         // 尝试解释为嵌套消息

@@ -103,19 +103,19 @@ impl DecoderPipeline {
         }
 
         // 2. 尝试 MsgPack（以特定字节开头）
-        if let Some(first) = data.first() {
-            if matches!(first, 0x80..=0x9f | 0xdc..=0xdf) {
-                if let DecodedPayload::MsgPack(v) = msgpack::decode_msgpack(data) {
-                    return DecodedPayload::MsgPack(v);
-                }
-            }
+        if let Some(first) = data.first()
+            && matches!(first, 0x80..=0x9f | 0xdc..=0xdf)
+            && let DecodedPayload::MsgPack(v) = msgpack::decode_msgpack(data)
+        {
+            return DecodedPayload::MsgPack(v);
         }
 
         // 3. Avro 容器检测
-        if data.len() >= 4 && &data[0..4] == b"Obj\x01" {
-            if let DecodedPayload::Avro(s) = avro::decode_avro(data) {
-                return DecodedPayload::Avro(s);
-            }
+        if data.len() >= 4
+            && &data[0..4] == b"Obj\x01"
+            && let DecodedPayload::Avro(s) = avro::decode_avro(data)
+        {
+            return DecodedPayload::Avro(s);
         }
 
         // 4. 尝试文本（编码检测）

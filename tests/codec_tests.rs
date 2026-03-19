@@ -179,12 +179,21 @@ mod tests {
 
     #[test]
     fn test_decoded_payload_format_name() {
-        assert_eq!(DecodedPayload::Json(serde_json::Value::Null).format_name(), "JSON");
+        assert_eq!(
+            DecodedPayload::Json(serde_json::Value::Null).format_name(),
+            "JSON"
+        );
         assert_eq!(DecodedPayload::Text("".to_string()).format_name(), "Text");
         assert_eq!(DecodedPayload::Binary(vec![]).format_name(), "Binary");
-        assert_eq!(DecodedPayload::Protobuf("".to_string()).format_name(), "Protobuf");
+        assert_eq!(
+            DecodedPayload::Protobuf("".to_string()).format_name(),
+            "Protobuf"
+        );
         assert_eq!(DecodedPayload::Avro("".to_string()).format_name(), "Avro");
-        assert_eq!(DecodedPayload::MsgPack(serde_json::Value::Null).format_name(), "MsgPack");
+        assert_eq!(
+            DecodedPayload::MsgPack(serde_json::Value::Null).format_name(),
+            "MsgPack"
+        );
         assert_eq!(DecodedPayload::Error("".to_string()).format_name(), "Error");
     }
 

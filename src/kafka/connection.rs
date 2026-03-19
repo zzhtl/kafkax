@@ -27,20 +27,19 @@ pub fn create_consumer(config: &ConnectionConfig) -> Result<StreamConsumer> {
     if matches!(
         config.security_protocol,
         SecurityProtocol::Ssl | SecurityProtocol::SaslSsl
-    ) {
-        if let Some(ssl) = &config.ssl {
-            if let Some(ca) = &ssl.ca_location {
-                client_config.set("ssl.ca.location", ca);
-            }
-            if let Some(cert) = &ssl.cert_location {
-                client_config.set("ssl.certificate.location", cert);
-            }
-            if let Some(key) = &ssl.key_location {
-                client_config.set("ssl.key.location", key);
-            }
-            if let Some(pwd) = &ssl.key_password {
-                client_config.set("ssl.key.password", pwd);
-            }
+    ) && let Some(ssl) = &config.ssl
+    {
+        if let Some(ca) = &ssl.ca_location {
+            client_config.set("ssl.ca.location", ca);
+        }
+        if let Some(cert) = &ssl.cert_location {
+            client_config.set("ssl.certificate.location", cert);
+        }
+        if let Some(key) = &ssl.key_location {
+            client_config.set("ssl.key.location", key);
+        }
+        if let Some(pwd) = &ssl.key_password {
+            client_config.set("ssl.key.password", pwd);
         }
     }
 

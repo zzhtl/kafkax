@@ -3,10 +3,10 @@ use crate::kafka::types::DecodedPayload;
 /// 尝试将 bytes 解码为 JSON
 pub fn decode_json(data: &[u8]) -> DecodedPayload {
     // 先尝试 UTF-8 解析
-    if let Ok(text) = std::str::from_utf8(data) {
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(text.trim()) {
-            return DecodedPayload::Json(value);
-        }
+    if let Ok(text) = std::str::from_utf8(data)
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(text.trim())
+    {
+        return DecodedPayload::Json(value);
     }
 
     // 尝试其他编码转 UTF-8 后解析

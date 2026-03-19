@@ -36,6 +36,7 @@ pub fn fetch_watermarks(
     topic: &str,
     partition: i32,
 ) -> Result<(i64, i64)> {
-    let (low, high) = consumer.fetch_watermarks(topic, partition, std::time::Duration::from_secs(5))?;
+    let (low, high) =
+        consumer.fetch_watermarks(topic, partition, std::time::Duration::from_secs(5))?;
     Ok((low, high))
 }
