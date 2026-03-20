@@ -1,14 +1,14 @@
 use iced::widget::text_editor;
 
-use crate::kafka::types::{DecodedMessage, PageData};
+use crate::kafka::types::{DecodedMessage, MessageSummary, PageData, SortOrder, sort_summaries};
 
 /// 表格状态（分页、搜索）
 #[derive(Debug, Clone)]
 pub struct TableState {
     /// 当前页消息
-    pub messages: Vec<DecodedMessage>,
+    pub messages: Vec<MessageSummary>,
     /// 全分区搜索的全部命中结果
-    pub search_results: Option<Vec<DecodedMessage>>,
+    pub search_results: Option<Vec<MessageSummary>>,
     /// 最近一次全分区搜索扫描的消息数量
     pub search_scanned_messages: Option<usize>,
     /// 进入搜索前的普通浏览页码
@@ -17,6 +17,8 @@ pub struct TableState {
     pub current_page: usize,
     /// 每页消息数
     pub page_size: usize,
+    /// 排序方向
+    pub sort_order: SortOrder,
     /// 总消息数
     pub total_messages: i64,
     /// Low watermark
@@ -27,6 +29,8 @@ pub struct TableState {
     pub selected_index: Option<usize>,
     /// 详情区只读文本内容
     pub detail_content: text_editor::Content,
+    /// 详情区是否仍在后台准备内容
+    pub detail_loading: bool,
     /// 搜索关键词
     pub search_query: String,
     /// 是否正在加载
@@ -48,11 +52,13 @@ impl Default for TableState {
             browse_page_before_search: None,
             current_page: 0,
             page_size: 100,
+            sort_order: SortOrder::Desc,
             total_messages: 0,
             low_watermark: 0,
             high_watermark: 0,
             selected_index: None,
             detail_content: text_editor::Content::new(),
+            detail_loading: false,
             search_query: String::new(),
             loading: false,
             search_in_progress: false,
@@ -67,12 +73,25 @@ impl TableState {
     pub fn set_search_query(&mut self, query: String) {
         self.search_query = query;
         self.selected_index = None;
-        self.detail_content = text_editor::Content::new();
+        self.clear_detail();
     }
 
     /// 更新详情区只读文本
     pub fn set_detail_text(&mut self, text: impl AsRef<str>) {
         self.detail_content = text_editor::Content::with_text(text.as_ref());
+        self.detail_loading = false;
+    }
+
+    /// 详情区进入后台加载态
+    pub fn begin_detail_loading(&mut self, placeholder: impl AsRef<str>) {
+        self.detail_content = text_editor::Content::with_text(placeholder.as_ref());
+        self.detail_loading = true;
+    }
+
+    /// 清理详情区内容
+    pub fn clear_detail(&mut self) {
+        self.detail_content = text_editor::Content::new();
+        self.detail_loading = false;
     }
 
     /// 总页数
@@ -81,11 +100,6 @@ impl TableState {
             return 0;
         }
         (self.total_messages as usize).div_ceil(self.page_size)
-    }
-
-    /// 当前页的起始 offset
-    pub fn current_offset(&self) -> i64 {
-        self.low_watermark + (self.current_page as i64 * self.page_size as i64)
     }
 
     /// 是否可以翻到上一页
@@ -116,7 +130,7 @@ impl TableState {
         self.load_time_ms = None;
         self.error_message = None;
         self.selected_index = None;
-        self.detail_content = text_editor::Content::new();
+        self.clear_detail();
     }
 
     /// 清理临时反馈
@@ -133,7 +147,7 @@ impl TableState {
         self.search_scanned_messages = None;
         self.current_page = self.browse_page_before_search.take().unwrap_or(0);
         self.selected_index = None;
-        self.detail_content = text_editor::Content::new();
+        self.clear_detail();
         self.loading = false;
         self.search_in_progress = false;
         self.error_message = None;
@@ -153,19 +167,24 @@ impl TableState {
         self.search_in_progress = false;
         self.load_time_ms = Some(load_time_ms);
         self.selected_index = None;
-        self.detail_content = text_editor::Content::new();
+        self.clear_detail();
         self.error_message = None;
     }
 
     /// 应用全分区搜索结果
     pub fn apply_search_results(
         &mut self,
-        results: Vec<DecodedMessage>,
+        decoded_results: Vec<DecodedMessage>,
         scanned_messages: usize,
         low_watermark: i64,
         high_watermark: i64,
         load_time_ms: u128,
     ) {
+        let mut results: Vec<MessageSummary> = decoded_results
+            .into_iter()
+            .map(|msg| msg.into_summary(""))
+            .collect();
+        sort_summaries(&mut results, self.sort_order);
         self.search_results = Some(results);
         self.search_scanned_messages = Some(scanned_messages);
         self.current_page = 0;
@@ -179,7 +198,7 @@ impl TableState {
         self.search_in_progress = false;
         self.load_time_ms = Some(load_time_ms);
         self.selected_index = None;
-        self.detail_content = text_editor::Content::new();
+        self.clear_detail();
         self.error_message = None;
         self.apply_search_page();
     }
@@ -200,9 +219,28 @@ impl TableState {
         };
         self.total_messages = results.len() as i64;
         self.selected_index = None;
-        self.detail_content = text_editor::Content::new();
+        self.clear_detail();
         self.loading = false;
         self.search_in_progress = false;
+    }
+
+    /// 切换排序方向，并同步缓存中的搜索结果
+    pub fn set_sort_order(&mut self, order: SortOrder) -> bool {
+        if self.sort_order == order {
+            return false;
+        }
+
+        self.sort_order = order;
+        self.current_page = 0;
+        self.selected_index = None;
+        self.clear_detail();
+
+        if let Some(results) = self.search_results.as_mut() {
+            sort_summaries(results, order);
+            self.apply_search_page();
+        }
+
+        true
     }
 
     /// 记录加载失败
@@ -218,8 +256,8 @@ impl TableState {
         self.search_results.is_some()
     }
 
-    /// 获取当前选中的消息
-    pub fn selected_message(&self) -> Option<&DecodedMessage> {
+    /// 获取当前选中的消息摘要
+    pub fn selected_message(&self) -> Option<&MessageSummary> {
         self.selected_index.and_then(|idx| self.messages.get(idx))
     }
 }
@@ -229,7 +267,7 @@ mod tests {
     use chrono::TimeZone;
 
     use super::TableState;
-    use crate::kafka::types::{DecodedMessage, DecodedPayload, KafkaMessage};
+    use crate::kafka::types::{DecodedMessage, DecodedPayload, KafkaMessage, SortOrder};
 
     fn sample_message(offset: i64) -> DecodedMessage {
         DecodedMessage {
@@ -304,11 +342,30 @@ mod tests {
         state.current_page = 1;
         state.apply_search_page();
         assert_eq!(state.messages.len(), 1);
-        assert_eq!(state.messages[0].raw.offset, 3);
+        assert_eq!(state.messages[0].offset, 1);
 
         state.clear_search_results();
         assert_eq!(state.current_page, 2);
         assert!(state.search_results.is_none());
         assert!(state.search_scanned_messages.is_none());
+    }
+
+    #[test]
+    fn changing_sort_order_reorders_cached_search_results() {
+        let mut state = TableState::default();
+
+        state.apply_search_results(
+            vec![sample_message(1), sample_message(3), sample_message(2)],
+            3,
+            0,
+            3,
+            5,
+        );
+        assert_eq!(state.sort_order, SortOrder::Desc);
+        assert_eq!(state.messages[0].offset, 3);
+
+        assert!(state.set_sort_order(SortOrder::Asc));
+        assert_eq!(state.messages[0].offset, 1);
+        assert_eq!(state.current_page, 0);
     }
 }

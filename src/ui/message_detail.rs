@@ -27,9 +27,10 @@ pub fn view(state: &TableState) -> Element<'_, Message> {
 
         Some(msg) => {
             let timestamp = msg
-                .raw
                 .timestamp
-                .map(|timestamp| timestamp.format("%Y-%m-%d %H:%M:%S").to_string())
+                .map(|ts: chrono::DateTime<chrono::Utc>| {
+                    ts.format("%Y-%m-%d %H:%M:%S").to_string()
+                })
                 .unwrap_or_else(|| "无时间戳".to_string());
 
             let header = column![
@@ -46,9 +47,9 @@ pub fn view(state: &TableState) -> Element<'_, Message> {
                 ]
                 .align_y(iced::Alignment::Center),
                 row![
-                    meta_badge(msg.raw.topic.clone()),
-                    meta_badge(format!("P-{}", msg.raw.partition)),
-                    meta_badge(format!("Offset {}", msg.raw.offset)),
+                    meta_badge(msg.topic.clone()),
+                    meta_badge(msg.partition_label.clone()),
+                    meta_badge(format!("Offset {}", msg.offset)),
                     meta_badge(timestamp),
                 ]
                 .spacing(8)
@@ -81,9 +82,13 @@ pub fn view(state: &TableState) -> Element<'_, Message> {
 
             let detail = column![
                 header,
-                text("支持鼠标拖拽选区并直接复制；整条复制统一输出 JSON。")
-                    .size(11)
-                    .color(AppColors::TEXT_MUTED),
+                text(if state.detail_loading {
+                    "正在后台格式化当前消息，完成后会自动刷新；拖拽复制仅对已加载内容生效。"
+                } else {
+                    "支持鼠标拖拽选区并直接复制；整条复制统一输出 JSON。"
+                })
+                .size(11)
+                .color(AppColors::TEXT_MUTED),
                 scrollable(container(editor).height(Length::Fill)),
             ]
             .spacing(10)

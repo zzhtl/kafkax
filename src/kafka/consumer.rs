@@ -1,25 +1,32 @@
+use std::ffi::{CStr, CString};
+use std::ptr;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rdkafka::TopicPartitionList;
-use rdkafka::consumer::{Consumer, StreamConsumer};
-use rdkafka::message::Message;
+use rdkafka::bindings as rdsys;
+use rdkafka::consumer::{BaseConsumer, Consumer};
 
 use crate::codec::DecoderPipeline;
 use crate::config::ConnectionConfig;
 use crate::kafka::connection;
-use crate::kafka::types::{KafkaMessage, OffsetRange, PageData, SearchResult};
+use crate::kafka::types::{
+    KafkaMessage, MessageSummary, OffsetRange, PageData, SearchResult, SortOrder,
+    sort_search_matches,
+};
 
 /// 从指定 partition 的 offset 开始消费一页数据
-pub async fn fetch_page(
-    consumer: &StreamConsumer,
+pub fn fetch_page(
+    connection_config: &ConnectionConfig,
     topic: &str,
     partition: i32,
-    start_offset: i64,
+    page: usize,
     page_size: usize,
+    sort_order: SortOrder,
     decoder: &DecoderPipeline,
 ) -> Result<PageData> {
+    let consumer = connection::create_consumer(connection_config)?;
+
     // 获取 watermark
     let (low, high) = consumer.fetch_watermarks(topic, partition, Duration::from_secs(5))?;
 
@@ -34,44 +41,25 @@ pub async fn fetch_page(
         });
     }
 
-    // 修正 offset 范围
-    let actual_offset = start_offset.max(low).min(high);
+    let actual_offset = page_start_offset(low, high, page, page_size, sort_order);
 
-    // 使用 assign 精确定位
-    let mut tpl = TopicPartitionList::new();
-    tpl.add_partition_offset(topic, partition, rdkafka::Offset::Offset(actual_offset))?;
-    consumer.assign(&tpl)?;
+    let mut simple_consumer =
+        SimplePartitionConsumer::start(&consumer, topic, partition, actual_offset)?;
 
     // 消费指定数量的消息
     let mut raw_messages = Vec::with_capacity(page_size);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
 
     while raw_messages.len() < page_size {
-        let remaining = deadline - tokio::time::Instant::now();
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             break;
         }
 
-        match tokio::time::timeout(remaining.min(Duration::from_millis(500)), consumer.recv()).await
-        {
-            Ok(Ok(msg)) => {
-                let kafka_msg = KafkaMessage {
-                    topic: msg.topic().to_string(),
-                    partition: msg.partition(),
-                    offset: msg.offset(),
-                    timestamp: msg.timestamp().to_millis().and_then(|ms| {
-                        DateTime::from_timestamp_millis(ms).map(|dt| dt.with_timezone(&Utc))
-                    }),
-                    key: msg.key().map(|k| k.to_vec()),
-                    payload: msg.payload().map(|p| p.to_vec()),
-                };
-                raw_messages.push(kafka_msg);
-            }
-            Ok(Err(e)) => {
-                tracing::warn!("消费消息失败: {}", e);
-                break;
-            }
-            Err(_) => {
+        match simple_consumer.poll(remaining.min(Duration::from_millis(500)))? {
+            SimplePoll::Message(message) => raw_messages.push(message),
+            SimplePoll::PartitionEof => break,
+            SimplePoll::Timeout => {
                 // 超时，可能已经没有更多消息了
                 if raw_messages.is_empty() {
                     continue;
@@ -82,18 +70,18 @@ pub async fn fetch_page(
     }
 
     // 批量解码
-    let decoded = decoder.decode_batch(raw_messages);
+    let mut decoded = decoder.decode_batch(raw_messages);
+    sort_search_matches(&mut decoded, sort_order);
 
-    // 计算页码
     let total = high - low;
-    let page = if total > 0 {
-        ((actual_offset - low) / page_size as i64) as usize
-    } else {
-        0
-    };
+
+    let summaries: Vec<MessageSummary> = decoded
+        .into_iter()
+        .map(|msg| msg.into_summary(""))
+        .collect();
 
     Ok(PageData {
-        messages: decoded,
+        messages: summaries,
         page,
         total_messages: total,
         low_watermark: low,
@@ -103,7 +91,7 @@ pub async fn fetch_page(
 
 /// 获取 offset 范围
 pub fn get_offset_range(
-    consumer: &StreamConsumer,
+    consumer: &BaseConsumer,
     topic: &str,
     partition: i32,
 ) -> Result<OffsetRange> {
@@ -112,18 +100,14 @@ pub fn get_offset_range(
 }
 
 /// 搜索指定 partition 中所有仍保留的消息
-pub async fn search_partition(
+pub fn search_partition(
     connection_config: &ConnectionConfig,
     topic: &str,
     partition: i32,
     query: &str,
     decoder: &DecoderPipeline,
 ) -> Result<SearchResult> {
-    let mut search_config = connection_config.clone();
-    let group_id = connection_config.consumer_group_id();
-    search_config.group_id = Some(format!("{}-search-{}", group_id, uuid::Uuid::new_v4()));
-
-    let consumer = connection::create_consumer(&search_config)?;
+    let consumer = connection::create_consumer(connection_config)?;
     let (low, high) = consumer.fetch_watermarks(topic, partition, Duration::from_secs(5))?;
 
     if high <= low {
@@ -135,9 +119,7 @@ pub async fn search_partition(
         });
     }
 
-    let mut tpl = TopicPartitionList::new();
-    tpl.add_partition_offset(topic, partition, rdkafka::Offset::Offset(low))?;
-    consumer.assign(&tpl)?;
+    let mut simple_consumer = SimplePartitionConsumer::start(&consumer, topic, partition, low)?;
 
     let mut scanned_messages = 0usize;
     let mut matches = Vec::new();
@@ -146,32 +128,19 @@ pub async fn search_partition(
     let mut last_offset = low.saturating_sub(1);
 
     while last_offset < final_offset {
-        match tokio::time::timeout(Duration::from_secs(2), consumer.recv()).await {
-            Ok(Ok(msg)) => {
+        match simple_consumer.poll(Duration::from_secs(2))? {
+            SimplePoll::Message(kafka_message) => {
                 timeout_streak = 0;
-                last_offset = msg.offset();
+                last_offset = kafka_message.offset;
                 scanned_messages += 1;
-
-                let kafka_message = KafkaMessage {
-                    topic: msg.topic().to_string(),
-                    partition: msg.partition(),
-                    offset: msg.offset(),
-                    timestamp: msg.timestamp().to_millis().and_then(|ms| {
-                        DateTime::from_timestamp_millis(ms).map(|dt| dt.with_timezone(&Utc))
-                    }),
-                    key: msg.key().map(|k| k.to_vec()),
-                    payload: msg.payload().map(|p| p.to_vec()),
-                };
 
                 let decoded = decoder.decode(kafka_message);
                 if decoded.matches_query(query) {
                     matches.push(decoded);
                 }
             }
-            Ok(Err(error)) => {
-                return Err(error.into());
-            }
-            Err(_) => {
+            SimplePoll::PartitionEof => break,
+            SimplePoll::Timeout => {
                 timeout_streak += 1;
                 if timeout_streak >= 5 {
                     anyhow::bail!(
@@ -192,12 +161,185 @@ pub async fn search_partition(
     })
 }
 
+enum SimplePoll {
+    Message(KafkaMessage),
+    Timeout,
+    PartitionEof,
+}
+
+struct SimplePartitionConsumer<'a> {
+    consumer: &'a BaseConsumer,
+    topic_handle: *mut rdsys::rd_kafka_topic_t,
+    topic: String,
+    partition: i32,
+    started: bool,
+}
+
+impl<'a> SimplePartitionConsumer<'a> {
+    fn start(consumer: &'a BaseConsumer, topic: &str, partition: i32, offset: i64) -> Result<Self> {
+        let topic_name =
+            CString::new(topic).with_context(|| format!("Topic 名称包含非法字符: {topic}"))?;
+        let topic_handle = unsafe {
+            rdsys::rd_kafka_topic_new(
+                consumer.client().native_ptr(),
+                topic_name.as_ptr(),
+                ptr::null_mut(),
+            )
+        };
+
+        if topic_handle.is_null() {
+            anyhow::bail!("创建 Topic 句柄失败: {topic}");
+        }
+
+        let mut this = Self {
+            consumer,
+            topic_handle,
+            topic: topic.to_string(),
+            partition,
+            started: false,
+        };
+
+        let start_result =
+            unsafe { rdsys::rd_kafka_consume_start(this.topic_handle, partition, offset) };
+        if start_result == -1 {
+            let os_error = std::io::Error::last_os_error();
+            anyhow::bail!(
+                "启动分区读取失败: topic={}, partition={}, offset={}, errno={}",
+                topic,
+                partition,
+                offset,
+                os_error
+            );
+        }
+
+        this.started = true;
+        Ok(this)
+    }
+
+    fn poll(&mut self, timeout: Duration) -> Result<SimplePoll> {
+        let timeout_ms = timeout
+            .as_millis()
+            .min(i32::MAX as u128)
+            .try_into()
+            .unwrap_or(i32::MAX);
+        let message_ptr =
+            unsafe { rdsys::rd_kafka_consume(self.topic_handle, self.partition, timeout_ms) };
+
+        if message_ptr.is_null() {
+            let os_error = std::io::Error::last_os_error();
+            if os_error.kind() == std::io::ErrorKind::TimedOut {
+                return Ok(SimplePoll::Timeout);
+            }
+
+            anyhow::bail!(
+                "读取分区消息失败: topic={}, partition={}, errno={}",
+                self.topic,
+                self.partition,
+                os_error
+            );
+        }
+
+        let message = SimpleMessage::new(message_ptr);
+        let err = unsafe { (*message.ptr).err };
+        if err != rdsys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR_NO_ERROR {
+            if err == rdsys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR__PARTITION_EOF {
+                return Ok(SimplePoll::PartitionEof);
+            }
+
+            let err_str = unsafe {
+                CStr::from_ptr(rdsys::rd_kafka_message_errstr(message.ptr))
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            anyhow::bail!(
+                "读取分区消息失败: topic={}, partition={}, err={}",
+                self.topic,
+                self.partition,
+                err_str
+            );
+        }
+
+        Ok(SimplePoll::Message(message.to_owned_message(&self.topic)))
+    }
+}
+
+impl Drop for SimplePartitionConsumer<'_> {
+    fn drop(&mut self) {
+        if self.started {
+            let stop_result =
+                unsafe { rdsys::rd_kafka_consume_stop(self.topic_handle, self.partition) };
+            if stop_result == -1 {
+                let os_error = std::io::Error::last_os_error();
+                tracing::warn!(
+                    "停止分区读取失败: topic={}, partition={}, errno={}",
+                    self.topic,
+                    self.partition,
+                    os_error
+                );
+            }
+        }
+
+        unsafe {
+            rdsys::rd_kafka_topic_destroy(self.topic_handle);
+            rdsys::rd_kafka_poll(self.consumer.client().native_ptr(), 0);
+        }
+    }
+}
+
+struct SimpleMessage {
+    ptr: *mut rdsys::rd_kafka_message_t,
+}
+
+impl SimpleMessage {
+    fn new(ptr: *mut rdsys::rd_kafka_message_t) -> Self {
+        Self { ptr }
+    }
+
+    fn to_owned_message(&self, topic: &str) -> KafkaMessage {
+        let message = unsafe { &*self.ptr };
+        let mut timestamp_type = rdsys::rd_kafka_timestamp_type_t::RD_KAFKA_TIMESTAMP_NOT_AVAILABLE;
+        let timestamp_ms =
+            unsafe { rdsys::rd_kafka_message_timestamp(self.ptr, &mut timestamp_type) };
+
+        KafkaMessage {
+            topic: topic.to_string(),
+            partition: message.partition,
+            offset: message.offset,
+            timestamp: if timestamp_ms >= 0 {
+                DateTime::from_timestamp_millis(timestamp_ms).map(|dt| dt.with_timezone(&Utc))
+            } else {
+                None
+            },
+            key: bytes_from_ptr(message.key, message.key_len),
+            payload: bytes_from_ptr(message.payload, message.len),
+        }
+    }
+}
+
+impl Drop for SimpleMessage {
+    fn drop(&mut self) {
+        unsafe {
+            rdsys::rd_kafka_message_destroy(self.ptr);
+        }
+    }
+}
+
+fn bytes_from_ptr(ptr: *mut std::ffi::c_void, len: usize) -> Option<Vec<u8>> {
+    if ptr.is_null() {
+        return None;
+    }
+
+    let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) };
+    Some(bytes.to_vec())
+}
+
 /// 搜索指定 topic 的所有 partition 中仍保留的消息
-pub async fn search_topic(
+pub fn search_topic(
     connection_config: &ConnectionConfig,
     topic: &str,
     partitions: &[i32],
     query: &str,
+    sort_order: SortOrder,
     decoder: &DecoderPipeline,
 ) -> Result<SearchResult> {
     if partitions.is_empty() {
@@ -216,7 +358,6 @@ pub async fn search_topic(
 
     for &partition in partitions {
         let result = search_partition(connection_config, topic, partition, query, decoder)
-            .await
             .with_context(|| format!("搜索 Topic {topic} 的 Partition {partition} 失败"))?;
 
         scanned_messages += result.scanned_messages;
@@ -225,14 +366,7 @@ pub async fn search_topic(
         high_watermark = high_watermark.max(result.high_watermark);
     }
 
-    matches.sort_by(|left, right| {
-        right
-            .raw
-            .timestamp
-            .cmp(&left.raw.timestamp)
-            .then_with(|| left.raw.partition.cmp(&right.raw.partition))
-            .then_with(|| right.raw.offset.cmp(&left.raw.offset))
-    });
+    sort_search_matches(&mut matches, sort_order);
 
     Ok(SearchResult {
         matches,
@@ -248,4 +382,49 @@ pub async fn search_topic(
             high_watermark
         },
     })
+}
+
+fn page_start_offset(
+    low_watermark: i64,
+    high_watermark: i64,
+    page: usize,
+    page_size: usize,
+    sort_order: SortOrder,
+) -> i64 {
+    if high_watermark <= low_watermark {
+        return low_watermark;
+    }
+
+    let page_size = page_size.max(1) as i64;
+    let highest_offset = high_watermark.saturating_sub(1);
+
+    match sort_order {
+        SortOrder::Asc => (low_watermark + page as i64 * page_size).min(highest_offset),
+        SortOrder::Desc => {
+            let page_span = (page as i64 + 1) * page_size;
+            (high_watermark - page_span)
+                .max(low_watermark)
+                .min(highest_offset)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::page_start_offset;
+    use crate::kafka::types::SortOrder;
+
+    #[test]
+    fn descending_page_starts_from_latest_offsets() {
+        assert_eq!(page_start_offset(0, 250, 0, 100, SortOrder::Desc), 150);
+        assert_eq!(page_start_offset(0, 250, 1, 100, SortOrder::Desc), 50);
+        assert_eq!(page_start_offset(0, 250, 2, 100, SortOrder::Desc), 0);
+    }
+
+    #[test]
+    fn ascending_page_starts_from_low_watermark() {
+        assert_eq!(page_start_offset(20, 250, 0, 100, SortOrder::Asc), 20);
+        assert_eq!(page_start_offset(20, 250, 1, 100, SortOrder::Asc), 120);
+        assert_eq!(page_start_offset(20, 250, 2, 100, SortOrder::Asc), 220);
+    }
 }

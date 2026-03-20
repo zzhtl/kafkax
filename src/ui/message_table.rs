@@ -1,7 +1,7 @@
 use iced::widget::{button, column, container, rich_text, row, scrollable, text};
 use iced::{Background, Border, Color, Element, Length, Theme};
 
-use crate::kafka::types::DecodedMessage;
+use crate::kafka::types::{MessageSummary, SortOrder};
 use crate::message::Message;
 use crate::state::TableState;
 use crate::theme::AppColors;
@@ -9,7 +9,7 @@ use crate::ui::syntax;
 
 /// 渲染消息列表表格
 pub fn view(state: &TableState) -> Element<'_, Message> {
-    let mut content = column![table_header()].spacing(8);
+    let mut content = column![table_header(state)].spacing(8);
 
     if let Some(error) = &state.error_message {
         content = content.push(feedback_banner(
@@ -64,15 +64,11 @@ pub fn view(state: &TableState) -> Element<'_, Message> {
                 .enumerate()
                 .map(|(idx, msg)| {
                     let is_selected = state.selected_index == Some(idx);
-                    let partition_str = format!("P-{}", msg.raw.partition);
-                    let offset_str = msg.raw.offset.to_string();
-                    let ts_str = msg
-                        .raw
-                        .timestamp
-                        .map(|ts| ts.format("%m-%d %H:%M:%S").to_string())
-                        .unwrap_or_else(|| "-".to_string());
-                    let key_str = msg.decoded_key.as_deref().unwrap_or("-").to_string();
-                    let value_str = value_summary(msg, search_query, 200);
+                    let partition_str = msg.partition_label.clone();
+                    let offset_str = msg.offset_label.clone();
+                    let ts_str = msg.ts_label.clone();
+                    let key_str = msg.key_label.clone();
+                    let value_str = msg.value_label.clone();
 
                     let bg_color = if is_selected {
                         AppColors::ROW_SELECTED
@@ -188,12 +184,12 @@ pub fn view(state: &TableState) -> Element<'_, Message> {
         .into()
 }
 
-fn table_header() -> Element<'static, Message> {
+fn table_header(state: &TableState) -> Element<'_, Message> {
     container(
         row![
             cell_text("分区", 72, AppColors::TEXT_SECONDARY),
             cell_text("Offset", 80, AppColors::TEXT_SECONDARY),
-            cell_text("时间", 150, AppColors::TEXT_SECONDARY),
+            time_sort_header(state.sort_order),
             cell_text("Key", 120, AppColors::TEXT_SECONDARY),
             text("消息摘要").size(12).color(AppColors::TEXT_SECONDARY),
         ]
@@ -210,6 +206,37 @@ fn table_header() -> Element<'static, Message> {
         },
         ..Default::default()
     })
+    .into()
+}
+
+fn time_sort_header(sort_order: SortOrder) -> Element<'static, Message> {
+    let next_order = sort_order.toggle();
+
+    button(
+        row![
+            text("时间").size(12).color(AppColors::TEXT_SECONDARY),
+            text(sort_order.indicator())
+                .size(11)
+                .color(AppColors::ACCENT),
+        ]
+        .spacing(4)
+        .align_y(iced::Alignment::Center)
+        .width(150),
+    )
+    .on_press(Message::SortOrderChanged(next_order))
+    .style(|_theme: &Theme, status| button::Style {
+        background: Some(Background::Color(
+            if matches!(status, button::Status::Hovered) {
+                AppColors::ROW_HOVER
+            } else {
+                Color::TRANSPARENT
+            },
+        )),
+        border: Border::default(),
+        text_color: AppColors::TEXT_SECONDARY,
+        ..Default::default()
+    })
+    .padding(0)
     .into()
 }
 
@@ -255,12 +282,8 @@ fn feedback_banner(
         .into()
 }
 
-fn value_summary(msg: &DecodedMessage, query: &str, max_len: usize) -> String {
-    if query.is_empty() {
-        msg.decoded_value.summary(max_len)
-    } else {
-        syntax::excerpt_for_search(&msg.decoded_value.full_display(), query, max_len)
-    }
+fn value_summary(msg: &MessageSummary, _query: &str, _max_len: usize) -> String {
+    msg.value_label.clone()
 }
 
 fn cell_text(value: &'static str, width: u16, color: Color) -> Element<'static, Message> {
