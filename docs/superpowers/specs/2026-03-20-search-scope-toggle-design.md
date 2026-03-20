@@ -38,8 +38,8 @@ pub search_all_partitions: bool,  // Default: false
 ### 3.2 新增 Message 变体
 
 ```rust
-/// 切换"全分区搜索"开关
-ToggleSearchAllPartitions,
+/// 设置"全分区搜索"开关状态（直接传入目标值，避免多次 toggle 竞态）
+SetSearchAllPartitions(bool),
 ```
 
 ---
@@ -60,8 +60,8 @@ let partitions = if self.state.table.search_all_partitions {
     all_partitions
 } else {
     match self.state.sidebar.selected_partition {
-        Some(p) => vec![p],   // 选中了具体分区，只搜该分区
-        None    => all_partitions,  // 只选了 topic，搜全部
+        Some(p) => vec![p],       // 选中了具体分区，只搜该分区
+        None    => all_partitions, // 只选了 topic，搜全部
     }
 };
 ```
@@ -78,33 +78,54 @@ let partitions = if self.state.table.search_all_partitions {
 [搜索框________________] [☐ 全分区搜索]  [排序 ▾]  [每页 ▾]
 ```
 
-使用 iced 的 `checkbox` widget：
+使用 iced 的 `checkbox` widget，直接传递目标 bool 值：
+
 ```rust
 checkbox("全分区搜索", state.search_all_partitions)
-    .on_toggle(|_| Message::ToggleSearchAllPartitions)
+    .on_toggle(Message::SetSearchAllPartitions)
     .size(14)
 ```
 
 ### 5.2 搜索框 Placeholder 更新
 
-根据当前状态动态显示占位符文本：
+`toolbar::view` 新增参数 `selected_partition: Option<i32>`，在函数内部提前生成占位符字符串以避免悬垂引用：
 
 ```rust
-let search_placeholder = if table.has_search_results() || table.search_in_progress {
-    "正在显示搜索结果"
-} else if !table.search_all_partitions {
-    if let Some(p) = sidebar.selected_partition {
-        // 动态格式化：需在 view 函数中用 format! 生成，传入 toolbar::view
-        &format!("输入关键词后回车搜索 Partition {p}")
+pub fn view(
+    table: &TableState,
+    decoder_type: DecoderType,
+    selected_partition: Option<i32>,
+) -> Element<'_, Message> {
+    let placeholder = if table.has_search_results() || table.search_in_progress {
+        "正在显示搜索结果".to_string()
+    } else if !table.search_all_partitions {
+        match selected_partition {
+            Some(p) => format!("输入关键词后回车搜索 Partition {p}"),
+            None    => "输入关键词后回车搜索全部分区".to_string(),
+        }
     } else {
-        "输入关键词后回车搜索全部分区"
-    }
-} else {
-    "输入关键词后回车搜索全部分区"
-};
+        "输入关键词后回车搜索全部分区".to_string()
+    };
+
+    let search_input = text_input(&placeholder, &table.search_query)
+        .on_input(Message::SearchInputChanged)
+        .on_submit(Message::Search)
+        // ...
 ```
 
-> 注：由于 iced text_input 的 placeholder 需要 `&str`，format! 字符串须在 view 函数中提前生成并传入。
+`app.rs` 的 `view()` 方法中更新调用签名：
+
+```rust
+// 旧
+let toolbar = ui::toolbar::view(&self.state.table, self.state.decoder.selected);
+
+// 新
+let toolbar = ui::toolbar::view(
+    &self.state.table,
+    self.state.decoder.selected,
+    self.state.sidebar.selected_partition,
+);
+```
 
 ---
 
@@ -112,10 +133,10 @@ let search_placeholder = if table.has_search_results() || table.search_in_progre
 
 | 文件 | 改动内容 |
 |------|----------|
-| `src/message.rs` | 新增 `ToggleSearchAllPartitions` 变体 |
+| `src/message.rs` | 新增 `SetSearchAllPartitions(bool)` 变体 |
 | `src/state/table_state.rs` | 新增 `search_all_partitions: bool` 字段，Default 为 `false` |
-| `src/ui/toolbar.rs` | 加 `checkbox` 控件；更新 placeholder 逻辑；toolbar::view 接收 `sidebar.selected_partition` |
-| `src/app.rs` | 处理 `ToggleSearchAllPartitions` 消息；更新 `begin_topic_search` 分区选择逻辑 |
+| `src/ui/toolbar.rs` | 新增 `selected_partition: Option<i32>` 参数；加 `checkbox` 控件；更新 placeholder 逻辑 |
+| `src/app.rs` | 处理 `SetSearchAllPartitions(bool)` 消息；更新 `begin_topic_search` 分区选择逻辑；更新 `view()` 中 `toolbar::view` 调用签名，传入 `self.state.sidebar.selected_partition` |
 
 ---
 
@@ -124,3 +145,5 @@ let search_placeholder = if table.has_search_results() || table.search_in_progre
 - **切换 checkbox 时若搜索词非空**：不自动重新搜索，仅更新状态。下次按 Enter 时生效。
 - **切换分区时**：`begin_topic_search` 会被自动调用（现有逻辑），新的分区选择逻辑自然生效。
 - **断开连接后重连**：`table` 被重置为 `Default`，`search_all_partitions` 回到 `false`，符合预期。
+- **搜索进行中切换 checkbox**：`search_in_progress` 为 `true` 时切换开关不影响正在执行的搜索（分区列表已在启动时固定），仅改变下次搜索行为。实现上无需特殊处理。
+- **勾选状态下从 partition 切换到 topic**：`selected_partition` 变为 `None`，checkbox 仍显示为勾选，但此时勾选与不勾选效果相同（均搜全部分区），无功能性问题，不需要自动取消勾选。
