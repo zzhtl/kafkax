@@ -1,5 +1,5 @@
 use iced::widget::{Space, button, column, container, row, scrollable, text};
-use iced::{Background, Border, Color, Element, Length, Theme, Font};
+use iced::{Background, Border, Color, Element, Length, Theme};
 
 use crate::message::Message;
 use crate::state::TableState;
