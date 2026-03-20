@@ -1,5 +1,5 @@
-use iced::widget::{Space, button, column, container, row, scrollable, text, text_editor};
-use iced::{Background, Border, Color, Element, Length, Theme};
+use iced::widget::{Space, button, column, container, row, scrollable, text};
+use iced::{Background, Border, Color, Element, Length, Theme, Font};
 
 use crate::message::Message;
 use crate::state::TableState;
@@ -57,39 +57,38 @@ pub fn view(state: &TableState) -> Element<'_, Message> {
             ]
             .spacing(10);
 
-            let editor = text_editor(&state.detail_content)
-                .on_action(Message::DetailEditorAction)
-                .font(theme::detail_font())
-                .size(13)
-                .height(Length::Fill)
-                .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
-                .style(|theme: &Theme, status| {
-                    let mut style = text_editor::default(theme, status);
-                    style.background = Background::Color(AppColors::BG_PRIMARY);
-                    style.border = Border {
-                        color: match status {
-                            text_editor::Status::Focused { .. } => AppColors::SEARCH_HIGHLIGHT,
-                            _ => AppColors::BORDER,
-                        },
+            let detail_str = state.detail_text.as_ref().clone();
+            let editor = scrollable(
+                container(
+                    text(detail_str)
+                        .font(theme::detail_font())
+                        .size(13)
+                        .color(AppColors::TEXT_PRIMARY),
+                )
+                .padding(12)
+                .width(Length::Fill)
+                .style(|_theme: &Theme| container::Style {
+                    background: Some(Background::Color(AppColors::BG_PRIMARY)),
+                    border: Border {
+                        color: AppColors::BORDER,
                         width: 1.0,
                         radius: 10.0.into(),
-                    };
-                    style.value = AppColors::TEXT_PRIMARY;
-                    style.placeholder = AppColors::TEXT_MUTED;
-                    style.selection = AppColors::SEARCH_HIGHLIGHT_BG;
-                    style
-                });
+                    },
+                    ..Default::default()
+                }),
+            )
+            .height(Length::Fill);
 
             let detail = column![
                 header,
                 text(if state.detail_loading {
-                    "正在后台格式化当前消息，完成后会自动刷新；拖拽复制仅对已加载内容生效。"
+                    "正在后台格式化当前消息，完成后会自动刷新。"
                 } else {
-                    "支持鼠标拖拽选区并直接复制；整条复制统一输出 JSON。"
+                    "点击右上角按钮可复制整条消息 JSON。"
                 })
                 .size(11)
                 .color(AppColors::TEXT_MUTED),
-                scrollable(container(editor).height(Length::Fill)),
+                editor,
             ]
             .spacing(10)
             .padding(12);

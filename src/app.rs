@@ -14,6 +14,7 @@ use rdkafka::consumer::BaseConsumer;
 use kafkax::codec::DecoderPipeline;
 use kafkax::config::{AppConfig, ConnectionConfig, SaslConfig, SslConfig};
 use kafkax::kafka;
+use kafkax::kafka::types::{MessageSummary, ScanLimits};
 use kafkax::message::Message;
 use kafkax::state::{AppNotice, AppState, ConnectionStatus};
 use kafkax::theme;
@@ -28,6 +29,14 @@ pub struct App {
     page_request_id: u64,
     search_request_id: u64,
     detail_request_id: u64,
+    // 搜索累积状态
+    search_total_partitions: usize,
+    search_received_partitions: usize,
+    search_accumulator: Vec<MessageSummary>,
+    search_low_watermark: i64,
+    search_high_watermark: i64,
+    search_start_time: Option<std::time::Instant>,
+    search_scan_limits: Option<ScanLimits>,
 }
 
 impl App {
@@ -69,6 +78,13 @@ impl App {
             page_request_id: 0,
             search_request_id: 0,
             detail_request_id: 0,
+            search_total_partitions: 0,
+            search_received_partitions: 0,
+            search_accumulator: Vec::new(),
+            search_low_watermark: 0,
+            search_high_watermark: 0,
+            search_start_time: None,
+            search_scan_limits: None,
         };
         (app, Task::none())
     }
@@ -309,38 +325,39 @@ impl App {
                     }
                 }
             }
-            Message::SearchLoaded(request_id, result) => {
+            Message::SearchProgress {
+                request_id,
+                partition,
+                hits,
+                local_scanned: _,
+                local_bytes: _,
+                stopped_early,
+            } => {
                 if request_id != self.search_request_id {
                     return Task::none();
                 }
 
-                match result {
-                    Ok((search_result, load_time)) => {
-                        let match_count = search_result.matches.len();
-                        let scanned_messages = search_result.scanned_messages;
-                        let low_watermark = search_result.low_watermark;
-                        let high_watermark = search_result.high_watermark;
+                self.search_accumulator.extend(hits);
+                self.search_received_partitions += 1;
 
-                        self.state.table.apply_search_results(
-                            search_result.matches,
-                            scanned_messages,
-                            low_watermark,
-                            high_watermark,
-                            load_time,
-                        );
-                        self.clear_detail_content();
-                        self.state.notice = Some(AppNotice::success(format!(
-                            "搜索完成：已扫描 {} 条，命中 {} 条",
-                            scanned_messages, match_count
-                        )));
-                        Task::none()
-                    }
-                    Err(error) => {
-                        self.state.table.fail_loading(error.clone());
-                        self.state.notice = Some(AppNotice::error(format!("搜索失败: {error}")));
-                        tracing::error!("搜索消息失败: {error}");
-                        Task::none()
-                    }
+                let scanned = self.search_scan_limits
+                    .as_ref()
+                    .map_or(0, |l| l.scanned());
+                self.state.notice = Some(AppNotice::info(format!(
+                    "正在搜索 partition {}... 已扫描 {} 条，命中 {} 条",
+                    partition,
+                    scanned,
+                    self.search_accumulator.len(),
+                )));
+
+                if stopped_early {
+                    tracing::info!("分区 {} 因超限停止", partition);
+                }
+
+                if self.search_received_partitions >= self.search_total_partitions {
+                    self.finalize_search()
+                } else {
+                    Task::none()
                 }
             }
             Message::DetailLoaded(request_id, result) => {
@@ -435,12 +452,6 @@ impl App {
                 self.load_selected_detail()
             }
             Message::CopySelectedMessage => self.copy_selected_json(),
-            Message::DetailEditorAction(action) => {
-                if !action.is_edit() {
-                    self.state.table.detail_content.perform(action);
-                }
-                Task::none()
-            }
 
             // --- 解码器 ---
             Message::DecoderChanged(decoder_type) => {
@@ -636,38 +647,111 @@ impl App {
 
         self.invalidate_page_requests();
         self.state.table.begin_partition_search();
-        self.state.notice = Some(AppNotice::info(format!(
-            "正在搜索 Topic {topic} 的 {} 个 Partition...",
-            partitions.len()
-        )));
+
+        // 重置累积状态
+        self.search_accumulator.clear();
+        self.search_total_partitions = partitions.len();
+        self.search_received_partitions = 0;
+        self.search_start_time = Some(Instant::now());
+        self.search_low_watermark = i64::MAX;
+        self.search_high_watermark = i64::MIN;
+
+        // 创建共享扫描限制（1百万条 OR 2GB）
+        let limits = ScanLimits::new(1_000_000, 2 * 1024 * 1024 * 1024);
+        self.search_scan_limits = Some(limits.clone());
 
         let request_id = self.next_search_request_id();
         let connection_config = self.state.connection_config.clone();
-        let sort_order = self.state.table.sort_order;
         let decoder = self.state.decoder.clone();
 
-        Task::perform(
-            async move {
-                tokio::task::spawn_blocking(move || {
-                    let start = Instant::now();
-                    let result = kafka::consumer::search_topic(
-                        &connection_config,
-                        &topic,
-                        &partitions,
-                        &query,
-                        sort_order,
-                        &decoder,
-                    );
-                    let elapsed = start.elapsed().as_millis();
-                    result
-                        .map(|data| (data, elapsed))
-                        .map_err(|error| error.to_string())
-                })
-                .await
-                .map_err(|error| format!("后台搜索任务异常终止: {error}"))?
-            },
-            move |result| Message::SearchLoaded(request_id, result),
-        )
+        self.state.notice = Some(AppNotice::info(format!(
+            "正在并行搜索 Topic {topic} 的 {} 个 Partition...",
+            partitions.len()
+        )));
+
+        // 每个分区独立 Task，Task::batch 并发执行
+        let tasks: Vec<Task<Message>> = partitions
+            .into_iter()
+            .map(|partition| {
+                let config = connection_config.clone();
+                let topic = topic.clone();
+                let query = query.clone();
+                let dec = decoder.clone();
+                let lim = limits.clone();
+
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            kafkax::kafka::consumer::search_partition_summarized(
+                                &config, &topic, partition, &query, &dec, &lim,
+                            )
+                        })
+                        .await
+                        .map_err(|e| format!("分区 {partition} 搜索任务异常: {e}"))?
+                        .map_err(|e| e.to_string())
+                    },
+                    move |result| match result {
+                        Ok((hits, scanned, bytes, stopped)) => Message::SearchProgress {
+                            request_id,
+                            partition,
+                            hits,
+                            local_scanned: scanned,
+                            local_bytes: bytes,
+                            stopped_early: stopped,
+                        },
+                        Err(err) => {
+                            tracing::error!("分区 {} 搜索失败: {}", partition, err);
+                            Message::SearchProgress {
+                                request_id,
+                                partition,
+                                hits: vec![],
+                                local_scanned: 0,
+                                local_bytes: 0,
+                                stopped_early: false,
+                            }
+                        }
+                    },
+                )
+            })
+            .collect();
+
+        Task::batch(tasks)
+    }
+
+    fn finalize_search(&mut self) -> Task<Message> {
+        let results = std::mem::take(&mut self.search_accumulator);
+        let scanned = self.search_scan_limits.as_ref().map_or(0, |l| l.scanned());
+        let scanned_bytes = self.search_scan_limits.as_ref().map_or(0, |l| l.bytes());
+        let low = self.search_low_watermark;
+        let high = self.search_high_watermark;
+        let match_count = results.len();
+        let elapsed = self
+            .search_start_time
+            .take()
+            .map_or(0, |t| t.elapsed().as_millis());
+
+        self.search_scan_limits = None;
+        self.search_total_partitions = 0;
+        self.search_received_partitions = 0;
+
+        let stopped = scanned_bytes >= 2 * 1024 * 1024 * 1024 || scanned >= 1_000_000;
+
+        self.state.table.apply_search_results(results, scanned, low, high, elapsed);
+
+        let msg = if stopped {
+            format!(
+                "搜索完成（已达扫描上限）：扫描 {} 条，命中 {} 条，耗时 {}ms",
+                scanned, match_count, elapsed
+            )
+        } else {
+            format!(
+                "搜索完成：扫描 {} 条，命中 {} 条，耗时 {}ms",
+                scanned, match_count, elapsed
+            )
+        };
+        self.state.notice = Some(AppNotice::success(msg));
+
+        Task::none()
     }
 
     fn begin_connect(&mut self, config: ConnectionConfig) -> Task<Message> {
@@ -700,7 +784,7 @@ impl App {
             self.state.notice = Some(AppNotice::info("详情尚未加载完成，请稍候再复制"));
             return Task::none();
         }
-        let detail = self.state.table.detail_content.text();
+        let detail = self.state.table.detail_text.as_ref().clone();
         if detail.trim().is_empty() {
             self.state.notice = Some(AppNotice::info("详情尚未加载完成，请稍候再复制"));
             return Task::none();
