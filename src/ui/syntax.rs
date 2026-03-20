@@ -266,26 +266,37 @@ fn find_match_ranges(text_str: &str, query: &str) -> Vec<(usize, usize)> {
         return Vec::new();
     }
 
+    // 一次性 lowercase，用 str::find 进行 Boyer-Moore-Horspool 搜索（零额外分配）
+    let text_lower = text_str.to_lowercase();
     let query_lower = query.to_lowercase();
-    let query_chars = query.chars().count();
-    if query_chars == 0 {
+    let query_bytes = query_lower.len();
+
+    if query_bytes == 0 || query_bytes > text_lower.len() {
         return Vec::new();
     }
 
-    let boundaries = char_boundaries(text_str);
     let mut ranges = Vec::new();
-    let mut i = 0;
-    let max_index = boundaries.len().saturating_sub(1);
+    let mut start = 0;
 
-    while i + query_chars <= max_index {
-        let start = boundaries[i];
-        let end = boundaries[i + query_chars];
+    while start + query_bytes <= text_lower.len() {
+        if let Some(rel_pos) = text_lower[start..].find(&query_lower) {
+            let byte_start = start + rel_pos;
+            let byte_end = byte_start + query_bytes;
 
-        if text_str[start..end].to_lowercase() == query_lower {
-            ranges.push((start, end));
-            i += query_chars;
+            // 确保字节边界是合法的 UTF-8 字符边界
+            if text_str.is_char_boundary(byte_start) && text_str.is_char_boundary(byte_end) {
+                ranges.push((byte_start, byte_end));
+                start = byte_end;
+            } else {
+                // 边界不合法（多字节字符分割），前进一个字符
+                start = byte_start
+                    + text_str[byte_start..]
+                        .chars()
+                        .next()
+                        .map_or(1, |c| c.len_utf8());
+            }
         } else {
-            i += 1;
+            break;
         }
     }
 
@@ -316,13 +327,6 @@ fn byte_index_at_char(text_str: &str, char_index: usize) -> usize {
         .unwrap_or(text_str.len())
 }
 
-fn char_boundaries(text_str: &str) -> Vec<usize> {
-    text_str
-        .char_indices()
-        .map(|(index, _)| index)
-        .chain(std::iter::once(text_str.len()))
-        .collect()
-}
 
 #[cfg(test)]
 mod tests {
