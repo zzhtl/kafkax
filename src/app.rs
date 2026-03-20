@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+use std::ffi::CString;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -5,8 +7,9 @@ use anyhow::Result;
 use iced::clipboard;
 use iced::keyboard;
 use iced::widget::{column, container, row};
+use iced::window;
 use iced::{Background, Border, Element, Length, Subscription, Task, Theme};
-use rdkafka::consumer::StreamConsumer;
+use rdkafka::consumer::BaseConsumer;
 
 use kafkax::codec::DecoderPipeline;
 use kafkax::config::{AppConfig, ConnectionConfig, SaslConfig, SslConfig};
@@ -20,9 +23,11 @@ use kafkax::ui;
 pub struct App {
     pub state: AppState,
     /// Kafka consumer（Arc 用于在异步任务中共享）
-    pub consumer: Option<Arc<StreamConsumer>>,
+    pub consumer: Option<Arc<BaseConsumer>>,
+    main_window_id: Option<window::Id>,
     page_request_id: u64,
     search_request_id: u64,
+    detail_request_id: u64,
 }
 
 impl App {
@@ -60,8 +65,10 @@ impl App {
         let app = Self {
             state,
             consumer: None,
+            main_window_id: None,
             page_request_id: 0,
             search_request_id: 0,
+            detail_request_id: 0,
         };
         (app, Task::none())
     }
@@ -190,6 +197,7 @@ impl App {
             Message::Connected(config, topics) => {
                 self.invalidate_page_requests();
                 self.invalidate_search_requests();
+                self.invalidate_detail_requests();
                 let name = config.name.clone();
                 // 重新创建 consumer 用于后续消费
                 match kafka::connection::create_consumer(&config) {
@@ -208,6 +216,7 @@ impl App {
                 self.state.connection_status = ConnectionStatus::Connected(name);
                 self.state.sidebar.topics = topics;
                 self.state.table.clear_feedback();
+                self.clear_detail_content();
                 self.state.show_connection_dialog = false;
                 self.state.notice = Some(AppNotice::success(format!(
                     "连接成功，共 {} 个 Topic",
@@ -222,11 +231,12 @@ impl App {
                 }
 
                 tracing::info!("连接成功，共 {} 个 topic", self.state.sidebar.topics.len());
-                Task::none()
+                self.schedule_platform_title_sync()
             }
             Message::ConnectionFailed(error) => {
                 self.invalidate_page_requests();
                 self.invalidate_search_requests();
+                self.invalidate_detail_requests();
                 if self.consumer.is_some() {
                     let current_name = self.state.connection_config.name.clone();
                     self.state.connection_status = ConnectionStatus::Connected(current_name);
@@ -237,11 +247,12 @@ impl App {
                     self.state.connection_status = ConnectionStatus::Error(error.clone());
                 }
                 tracing::error!("连接失败: {}", error);
-                Task::none()
+                self.schedule_platform_title_sync()
             }
             Message::Disconnect => {
                 self.invalidate_page_requests();
                 self.invalidate_search_requests();
+                self.invalidate_detail_requests();
                 self.consumer = None;
                 self.state.connection_status = ConnectionStatus::Disconnected;
                 self.state.connection_draft = self.state.connection_config.clone();
@@ -250,7 +261,7 @@ impl App {
                 self.state.notice = Some(AppNotice::info(
                     "已断开连接，可直接重连或切换到其他已保存配置",
                 ));
-                Task::none()
+                self.schedule_platform_title_sync()
             }
 
             // --- 侧边栏 ---
@@ -270,7 +281,7 @@ impl App {
                 }
                 self.state.table.current_page = 0;
                 self.state.table.selected_index = None;
-                self.sync_detail_content();
+                self.clear_detail_content();
 
                 if self.state.table.search_query.trim().is_empty() {
                     self.reload_current_page()
@@ -288,7 +299,7 @@ impl App {
                 match result {
                     Ok((page_data, load_time)) => {
                         self.state.table.apply_page_data(page_data, load_time);
-                        self.sync_detail_content();
+                        self.clear_detail_content();
                         Task::none()
                     }
                     Err(error) => {
@@ -317,7 +328,7 @@ impl App {
                             high_watermark,
                             load_time,
                         );
-                        self.sync_detail_content();
+                        self.clear_detail_content();
                         self.state.notice = Some(AppNotice::success(format!(
                             "搜索完成：已扫描 {} 条，命中 {} 条",
                             scanned_messages, match_count
@@ -331,6 +342,26 @@ impl App {
                         Task::none()
                     }
                 }
+            }
+            Message::DetailLoaded(request_id, result) => {
+                if request_id != self.detail_request_id {
+                    return Task::none();
+                }
+
+                match result {
+                    Ok(detail_text) => {
+                        self.state.table.set_detail_text(detail_text);
+                    }
+                    Err(error) => {
+                        self.state
+                            .table
+                            .set_detail_text(format!("加载消息详情失败: {error}"));
+                        self.state.notice =
+                            Some(AppNotice::error(format!("生成消息详情失败: {error}")));
+                        tracing::error!("生成消息详情失败: {error}");
+                    }
+                }
+                Task::none()
             }
             Message::Loading => {
                 self.state.table.begin_loading();
@@ -379,15 +410,29 @@ impl App {
                 self.state.table.page_size = size;
                 self.state.table.current_page = 0;
                 self.state.table.selected_index = None;
-                self.sync_detail_content();
+                self.clear_detail_content();
                 self.reload_current_page()
+            }
+            Message::SortOrderChanged(order) => {
+                if !self.state.table.set_sort_order(order) {
+                    return Task::none();
+                }
+
+                if self.state.table.search_in_progress {
+                    self.invalidate_search_requests();
+                    self.begin_topic_search()
+                } else if self.state.table.has_search_results() {
+                    self.clear_detail_content();
+                    Task::none()
+                } else {
+                    self.reload_current_page()
+                }
             }
 
             // --- 消息选中 ---
             Message::SelectMessage(idx) => {
                 self.state.table.selected_index = Some(idx);
-                self.sync_detail_content();
-                Task::none()
+                self.load_selected_detail()
             }
             Message::CopySelectedMessage => self.copy_selected_json(),
             Message::DetailEditorAction(action) => {
@@ -418,11 +463,18 @@ impl App {
                     self.state.table.clear_search_results();
                     self.reload_current_page()
                 } else {
-                    self.sync_detail_content();
+                    self.clear_detail_content();
                     Task::none()
                 }
             }
             Message::Search => self.begin_topic_search(),
+
+            // --- 窗口 ---
+            Message::WindowOpened(id) => {
+                self.main_window_id = Some(id);
+                self.schedule_platform_title_sync()
+            }
+            Message::ApplyPlatformWindowTitle => self.apply_platform_window_title(),
 
             // --- 键盘快捷键 ---
             Message::KeyPressed(key, modifiers) => self.handle_key(key, modifiers),
@@ -485,10 +537,9 @@ impl App {
 
     /// 获取当前选中 partition 的当前页数据
     fn fetch_current_page(&self, request_id: u64) -> Task<Message> {
-        let consumer = match &self.consumer {
-            Some(c) => Arc::clone(c),
-            None => return Task::none(),
-        };
+        if self.consumer.is_none() {
+            return Task::none();
+        }
 
         let topic = match &self.state.sidebar.selected_topic {
             Some(t) => t.clone(),
@@ -500,21 +551,32 @@ impl App {
             None => return Task::none(),
         };
 
-        let offset = self.state.table.current_offset();
+        let page = self.state.table.current_page;
         let page_size = self.state.table.page_size;
+        let sort_order = self.state.table.sort_order;
+        let connection_config = self.state.connection_config.clone();
         let decoder = self.state.decoder.clone();
 
         Task::perform(
             async move {
-                let start = Instant::now();
-                let result = kafka::consumer::fetch_page(
-                    &consumer, &topic, partition, offset, page_size, &decoder,
-                )
-                .await;
-                let elapsed = start.elapsed().as_millis();
-                result
-                    .map(|data| (data, elapsed))
-                    .map_err(|e| e.to_string())
+                tokio::task::spawn_blocking(move || {
+                    let start = Instant::now();
+                    let result = kafka::consumer::fetch_page(
+                        &connection_config,
+                        &topic,
+                        partition,
+                        page,
+                        page_size,
+                        sort_order,
+                        &decoder,
+                    );
+                    let elapsed = start.elapsed().as_millis();
+                    result
+                        .map(|data| (data, elapsed))
+                        .map_err(|error| error.to_string())
+                })
+                .await
+                .map_err(|error| format!("后台加载消息任务异常终止: {error}"))?
             },
             move |result| Message::PageLoaded(request_id, result),
         )
@@ -524,7 +586,7 @@ impl App {
     fn reload_current_page(&mut self) -> Task<Message> {
         if self.state.table.has_search_results() {
             self.state.table.apply_search_page();
-            self.sync_detail_content();
+            self.clear_detail_content();
             return Task::none();
         }
 
@@ -549,7 +611,7 @@ impl App {
                 self.state.table.clear_search_results();
                 return self.reload_current_page();
             }
-            self.sync_detail_content();
+            self.clear_detail_content();
             return Task::none();
         }
 
@@ -581,23 +643,28 @@ impl App {
 
         let request_id = self.next_search_request_id();
         let connection_config = self.state.connection_config.clone();
+        let sort_order = self.state.table.sort_order;
         let decoder = self.state.decoder.clone();
 
         Task::perform(
             async move {
-                let start = Instant::now();
-                let result = kafka::consumer::search_topic(
-                    &connection_config,
-                    &topic,
-                    &partitions,
-                    &query,
-                    &decoder,
-                )
-                .await;
-                let elapsed = start.elapsed().as_millis();
-                result
-                    .map(|data| (data, elapsed))
-                    .map_err(|error| error.to_string())
+                tokio::task::spawn_blocking(move || {
+                    let start = Instant::now();
+                    let result = kafka::consumer::search_topic(
+                        &connection_config,
+                        &topic,
+                        &partitions,
+                        &query,
+                        sort_order,
+                        &decoder,
+                    );
+                    let elapsed = start.elapsed().as_millis();
+                    result
+                        .map(|data| (data, elapsed))
+                        .map_err(|error| error.to_string())
+                })
+                .await
+                .map_err(|error| format!("后台搜索任务异常终止: {error}"))?
             },
             move |result| Message::SearchLoaded(request_id, result),
         )
@@ -609,13 +676,17 @@ impl App {
 
         Task::perform(
             async move {
-                let consumer =
-                    kafka::connection::create_consumer(&config).map_err(|e| e.to_string())?;
-                let topics =
-                    kafka::metadata::fetch_metadata(&consumer).map_err(|e| e.to_string())?;
-                Ok::<(ConnectionConfig, Vec<kafkax::kafka::types::TopicMeta>), String>((
-                    config, topics,
-                ))
+                tokio::task::spawn_blocking(move || {
+                    let consumer = kafka::connection::create_consumer(&config)
+                        .map_err(|error| Self::humanize_connection_error(&config, &error))?;
+                    let topics = kafka::metadata::fetch_metadata(&consumer)
+                        .map_err(|error| Self::humanize_connection_error(&config, &error))?;
+                    Ok::<(ConnectionConfig, Vec<kafkax::kafka::types::TopicMeta>), String>((
+                        config, topics,
+                    ))
+                })
+                .await
+                .map_err(|error| format!("后台连接任务异常终止: {error}"))?
             },
             |result| match result {
                 Ok((config, topics)) => Message::Connected(config, topics),
@@ -625,24 +696,56 @@ impl App {
     }
 
     fn copy_selected_json(&mut self) -> Task<Message> {
-        let Some(message) = self.state.table.selected_message().cloned() else {
-            self.state.notice = Some(AppNotice::info("请先选择一条消息再执行复制"));
+        if self.state.table.detail_loading || self.state.table.selected_index.is_none() {
+            self.state.notice = Some(AppNotice::info("详情尚未加载完成，请稍候再复制"));
+            return Task::none();
+        }
+        let detail = self.state.table.detail_content.text();
+        if detail.trim().is_empty() {
+            self.state.notice = Some(AppNotice::info("详情尚未加载完成，请稍候再复制"));
+            return Task::none();
+        }
+        self.state.notice = Some(AppNotice::success("已复制当前消息 JSON"));
+        clipboard::write::<Message>(detail)
+    }
+
+    fn load_selected_detail(&mut self) -> Task<Message> {
+        let Some(summary) = self.state.table.selected_message().cloned() else {
+            self.clear_detail_content();
             return Task::none();
         };
 
-        self.state.notice = Some(AppNotice::success("已复制当前消息 JSON"));
-        clipboard::write::<Message>(message.copyable_json())
+        let request_id = self.next_detail_request_id();
+        self.state.table.begin_detail_loading("正在拉取完整消息详情...");
+
+        let connection_config = self.state.connection_config.clone();
+        let decoder = self.state.decoder.clone();
+        let topic = summary.topic.clone();
+        let partition = summary.partition;
+        let offset = summary.offset;
+
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    kafkax::kafka::consumer::fetch_single_message(
+                        &connection_config,
+                        &topic,
+                        partition,
+                        offset,
+                        &decoder,
+                    )
+                })
+                .await
+                .map_err(|e| format!("后台详情任务异常终止: {e}"))?
+                .map_err(|e| e.to_string())
+            },
+            move |result| Message::DetailLoaded(request_id, result),
+        )
     }
 
-    fn sync_detail_content(&mut self) {
-        let detail_text = self
-            .state
-            .table
-            .selected_message()
-            .map(|message| message.copyable_json())
-            .unwrap_or_default();
-
-        self.state.table.set_detail_text(detail_text);
+    fn clear_detail_content(&mut self) {
+        self.invalidate_detail_requests();
+        self.state.table.clear_detail();
     }
 
     fn selected_topic_partitions(&self) -> Option<(String, Vec<i32>)> {
@@ -678,6 +781,67 @@ impl App {
 
     fn invalidate_search_requests(&mut self) {
         self.search_request_id = self.search_request_id.wrapping_add(1);
+    }
+
+    fn next_detail_request_id(&mut self) -> u64 {
+        self.detail_request_id = self.detail_request_id.wrapping_add(1);
+        self.detail_request_id
+    }
+
+    fn invalidate_detail_requests(&mut self) {
+        self.detail_request_id = self.detail_request_id.wrapping_add(1);
+    }
+
+    fn humanize_connection_error(
+        config: &ConnectionConfig,
+        error: &impl std::fmt::Display,
+    ) -> String {
+        let error = error.to_string();
+
+        if config.security_protocol.uses_sasl()
+            && error.contains("supported mechanisms: (n/a)")
+            && error.contains("Broker transport failure")
+        {
+            let mechanism = config
+                .sasl
+                .as_ref()
+                .map(|sasl| sasl.mechanism.label())
+                .unwrap_or("未指定");
+
+            return format!(
+                "SASL 握手失败，Broker 在认证前就关闭了连接。当前配置为 {} / {}，这通常意味着端口或 listener 协议不匹配，或者 Broker 未启用该 SASL 机制。原始错误: {}",
+                config.security_protocol.label(),
+                mechanism,
+                error
+            );
+        }
+
+        error
+    }
+
+    fn schedule_platform_title_sync(&self) -> Task<Message> {
+        if self.main_window_id.is_none() {
+            return Task::none();
+        }
+
+        Task::perform(
+            async {
+                tokio::task::yield_now().await;
+            },
+            |_| Message::ApplyPlatformWindowTitle,
+        )
+    }
+
+    fn apply_platform_window_title(&self) -> Task<Message> {
+        let Some(window_id) = self.main_window_id else {
+            return Task::none();
+        };
+
+        let title = self.title();
+        window::run(window_id, move |window| {
+            Self::sync_platform_window_title(window, &title);
+            Message::Noop
+        })
     }
 
     fn remember_connection(&mut self, connection: &ConnectionConfig) -> Result<()> {
@@ -827,12 +991,15 @@ impl App {
 
     /// 键盘订阅
     pub fn subscription(&self) -> Subscription<Message> {
-        keyboard::listen().map(|event| match event {
-            keyboard::Event::KeyPressed { key, modifiers, .. } => {
-                Message::KeyPressed(key, modifiers)
-            }
-            _ => Message::Noop,
-        })
+        Subscription::batch([
+            keyboard::listen().map(|event| match event {
+                keyboard::Event::KeyPressed { key, modifiers, .. } => {
+                    Message::KeyPressed(key, modifiers)
+                }
+                _ => Message::Noop,
+            }),
+            window::open_events().map(Message::WindowOpened),
+        ])
     }
 
     /// 处理键盘快捷键
@@ -854,7 +1021,7 @@ impl App {
             // Escape - 关闭对话框 / 取消选中
             Key::Named(Named::Escape) => {
                 self.state.table.selected_index = None;
-                self.sync_detail_content();
+                self.clear_detail_content();
                 Task::none()
             }
 
@@ -876,8 +1043,7 @@ impl App {
                 } else if !self.state.table.messages.is_empty() {
                     self.state.table.selected_index = Some(0);
                 }
-                self.sync_detail_content();
-                Task::none()
+                self.load_selected_detail()
             }
 
             // 方向键下 - 选中下一条
@@ -893,8 +1059,7 @@ impl App {
                 } else if len > 0 {
                     self.state.table.selected_index = Some(0);
                 }
-                self.sync_detail_content();
-                Task::none()
+                self.load_selected_detail()
             }
 
             // 方向键左 - 上一页
@@ -910,6 +1075,52 @@ impl App {
             Key::Named(Named::End) if modifiers.command() => self.update(Message::LastPage),
 
             _ => Task::none(),
+        }
+    }
+
+    fn sync_platform_window_title(window: &dyn window::Window, title: &str) {
+        #[cfg(target_os = "linux")]
+        {
+            use iced::window::raw_window_handle::{RawDisplayHandle, RawWindowHandle};
+
+            let Ok(display_handle) = window.display_handle() else {
+                return;
+            };
+            let Ok(window_handle) = window.window_handle() else {
+                return;
+            };
+
+            let RawDisplayHandle::Xlib(display) = display_handle.as_raw() else {
+                return;
+            };
+            let RawWindowHandle::Xlib(handle) = window_handle.as_raw() else {
+                return;
+            };
+
+            let Some(display_ptr) = display.display else {
+                return;
+            };
+            let Ok(title) = CString::new(title) else {
+                return;
+            };
+            let Ok(xlib) = x11_dl::xlib::Xlib::open() else {
+                return;
+            };
+
+            unsafe {
+                (xlib.Xutf8SetWMProperties)(
+                    display_ptr.as_ptr().cast(),
+                    handle.window,
+                    title.as_ptr(),
+                    title.as_ptr(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                );
+                (xlib.XFlush)(display_ptr.as_ptr().cast());
+            }
         }
     }
 }
@@ -930,7 +1141,9 @@ mod tests {
     use kafkax::config::{
         ConnectionConfig, SaslConfig, SaslMechanism, SecurityProtocol, SslConfig,
     };
+    use kafkax::kafka::types::SortOrder;
     use kafkax::message::Message;
+    use kafkax::state::ConnectionStatus;
 
     #[test]
     fn page_size_change_without_selection_does_not_leave_loading_state() {
@@ -1025,5 +1238,23 @@ mod tests {
 
         let error = App::prepare_connection_config(&invalid_ssl).unwrap_err();
         assert_eq!(error, "启用客户端证书时，请同时填写证书路径和私钥路径");
+    }
+
+    #[test]
+    fn non_ascii_connection_name_is_kept_in_window_title() {
+        let (mut app, _) = App::new();
+        app.state.connection_status = ConnectionStatus::Connected("默认连接".to_string());
+
+        assert_eq!(app.title(), "KafkaX - [默认连接]");
+    }
+
+    #[test]
+    fn sort_order_change_updates_state() {
+        let (mut app, _) = App::new();
+
+        let _task = app.update(Message::SortOrderChanged(SortOrder::Asc));
+
+        assert_eq!(app.state.table.sort_order, SortOrder::Asc);
+        assert_eq!(app.state.table.current_page, 0);
     }
 }

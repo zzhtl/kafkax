@@ -384,6 +384,43 @@ pub fn search_topic(
     })
 }
 
+/// 拉取单条消息并返回其 JSON 字符串表示（用于详情展示/复制）
+pub fn fetch_single_message(
+    connection_config: &ConnectionConfig,
+    topic: &str,
+    partition: i32,
+    offset: i64,
+    decoder: &DecoderPipeline,
+) -> Result<String> {
+    let consumer = connection::create_consumer(connection_config)?;
+    let mut simple_consumer =
+        SimplePartitionConsumer::start(&consumer, topic, partition, offset)?;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("拉取消息超时: topic={topic}, partition={partition}, offset={offset}");
+        }
+
+        match simple_consumer.poll(remaining.min(Duration::from_millis(500)))? {
+            SimplePoll::Message(kafka_message) => {
+                if kafka_message.offset == offset {
+                    let decoded = decoder.decode(kafka_message);
+                    return Ok(decoded.copyable_json());
+                }
+                // offset 不匹配则继续等下一条
+            }
+            SimplePoll::PartitionEof => {
+                anyhow::bail!(
+                    "已到分区末尾但未找到消息: topic={topic}, partition={partition}, offset={offset}"
+                );
+            }
+            SimplePoll::Timeout => continue,
+        }
+    }
+}
+
 fn page_start_offset(
     low_watermark: i64,
     high_watermark: i64,
