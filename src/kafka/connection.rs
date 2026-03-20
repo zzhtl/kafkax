@@ -1,17 +1,21 @@
 use anyhow::Result;
 use rdkafka::config::ClientConfig;
-use rdkafka::consumer::StreamConsumer;
+use rdkafka::consumer::BaseConsumer;
 
 use crate::config::{ConnectionConfig, SecurityProtocol};
 
-/// 根据连接配置创建 Kafka StreamConsumer
-pub fn create_consumer(config: &ConnectionConfig) -> Result<StreamConsumer> {
+/// 根据连接配置创建 Kafka BaseConsumer。
+///
+/// 当前应用只做手动分区分配和只读查询，不需要 consumer group 协调。
+/// 因此这里刻意不设置 `group.id`，避免触发额外的 GroupCoordinator 连接。
+pub fn create_consumer(config: &ConnectionConfig) -> Result<BaseConsumer> {
     let mut client_config = ClientConfig::new();
 
     client_config
         .set("bootstrap.servers", &config.brokers)
-        .set("group.id", config.consumer_group_id())
         .set("enable.auto.commit", "false")
+        .set("enable.auto.offset.store", "false")
+        .set("offset.store.method", "none")
         .set("auto.offset.reset", "earliest")
         .set("security.protocol", config.security_protocol.as_str());
 
@@ -43,6 +47,6 @@ pub fn create_consumer(config: &ConnectionConfig) -> Result<StreamConsumer> {
         }
     }
 
-    let consumer: StreamConsumer = client_config.create()?;
+    let consumer: BaseConsumer = client_config.create()?;
     Ok(consumer)
 }

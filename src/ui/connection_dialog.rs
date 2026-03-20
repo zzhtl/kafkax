@@ -94,7 +94,7 @@ pub fn view<'a>(
 
     let basic_section = section_card(
         "基本信息",
-        "连接名用于界面显示，消费组留空时会自动生成唯一值。",
+        "连接名用于界面显示；当前浏览模式不会加入消费组，消费组 ID 仅保留作配置备注。",
         column![
             row![
                 form_field(
@@ -118,7 +118,7 @@ pub fn view<'a>(
             .spacing(12),
             form_field(
                 "消费组 ID",
-                "可选，留空时自动生成",
+                "可选，仅作配置保存，不参与当前浏览拉取",
                 text_input(
                     "kafkax-readonly-group",
                     draft.group_id.as_deref().unwrap_or(""),

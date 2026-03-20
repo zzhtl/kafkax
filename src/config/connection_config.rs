@@ -50,10 +50,10 @@ impl SecurityProtocol {
 
     pub fn as_str(&self) -> &'static str {
         match self {
-            SecurityProtocol::Plaintext => "plaintext",
-            SecurityProtocol::Ssl => "ssl",
-            SecurityProtocol::SaslPlaintext => "sasl_plaintext",
-            SecurityProtocol::SaslSsl => "sasl_ssl",
+            SecurityProtocol::Plaintext => "PLAINTEXT",
+            SecurityProtocol::Ssl => "SSL",
+            SecurityProtocol::SaslPlaintext => "SASL_PLAINTEXT",
+            SecurityProtocol::SaslSsl => "SASL_SSL",
         }
     }
 

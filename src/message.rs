@@ -1,7 +1,6 @@
 use crate::codec::DecoderType;
 use crate::config::{ConnectionConfig, SaslMechanism, SecurityProtocol};
-use crate::kafka::types::{PageData, SearchResult, TopicMeta};
-use iced::widget::text_editor;
+use crate::kafka::types::{MessageSummary, PageData, SortOrder, TopicMeta};
 
 /// 全局消息枚举
 #[derive(Debug, Clone)]
@@ -59,8 +58,17 @@ pub enum Message {
     // --- 数据加载 ---
     /// 页数据加载完成
     PageLoaded(u64, Result<(PageData, u128), String>),
-    /// 全分区搜索完成
-    SearchLoaded(u64, Result<(SearchResult, u128), String>),
+    /// 单个分区搜索完成（并行搜索中每个分区独立返回）
+    SearchProgress {
+        request_id: u64,
+        partition: i32,
+        hits: Vec<MessageSummary>,
+        local_scanned: usize,
+        local_bytes: usize,
+        stopped_early: bool,
+    },
+    /// 消息详情后台生成完成
+    DetailLoaded(u64, Result<String, String>),
     /// 加载中状态
     Loading,
 
@@ -77,15 +85,14 @@ pub enum Message {
     GoToPage(usize),
     /// 修改每页大小
     PageSizeChanged(usize),
+    /// 修改排序方向
+    SortOrderChanged(SortOrder),
 
     // --- 消息 ---
     /// 选中消息
     SelectMessage(usize),
     /// 复制当前消息 JSON
     CopySelectedMessage,
-    /// 详情区编辑器动作
-    DetailEditorAction(text_editor::Action),
-
     // --- 解码器 ---
     /// 切换解码器
     DecoderChanged(DecoderType),
@@ -97,6 +104,10 @@ pub enum Message {
     Search,
 
     // --- 其他 ---
+    /// 主窗口已打开
+    WindowOpened(iced::window::Id),
+    /// 同步平台窗口标题
+    ApplyPlatformWindowTitle,
     /// 键盘事件
     KeyPressed(iced::keyboard::Key, iced::keyboard::Modifiers),
     /// 无操作

@@ -1,14 +1,14 @@
-use iced::widget::text_editor;
+use std::sync::Arc;
 
-use crate::kafka::types::{DecodedMessage, MessageSummary, PageData, SortOrder, sort_summaries};
+use crate::kafka::types::{MessageSummary, PageData, SortOrder, sort_summaries};
 
 /// 表格状态（分页、搜索）
 #[derive(Debug, Clone)]
 pub struct TableState {
     /// 当前页消息
     pub messages: Vec<MessageSummary>,
-    /// 全分区搜索的全部命中结果
-    pub search_results: Option<Vec<MessageSummary>>,
+    /// 全分区搜索的全部命中结果（Arc 包装，翻页无需复制）
+    pub search_results: Option<Arc<Vec<MessageSummary>>>,
     /// 最近一次全分区搜索扫描的消息数量
     pub search_scanned_messages: Option<usize>,
     /// 进入搜索前的普通浏览页码
@@ -27,8 +27,8 @@ pub struct TableState {
     pub high_watermark: i64,
     /// 当前选中的消息索引
     pub selected_index: Option<usize>,
-    /// 详情区只读文本内容
-    pub detail_content: text_editor::Content,
+    /// 详情区只读文本内容（Arc 包装，clone 只是原子计数 +1）
+    pub detail_text: Arc<String>,
     /// 详情区是否仍在后台准备内容
     pub detail_loading: bool,
     /// 搜索关键词
@@ -57,7 +57,7 @@ impl Default for TableState {
             low_watermark: 0,
             high_watermark: 0,
             selected_index: None,
-            detail_content: text_editor::Content::new(),
+            detail_text: Arc::new(String::new()),
             detail_loading: false,
             search_query: String::new(),
             loading: false,
@@ -76,21 +76,21 @@ impl TableState {
         self.clear_detail();
     }
 
-    /// 更新详情区只读文本
-    pub fn set_detail_text(&mut self, text: impl AsRef<str>) {
-        self.detail_content = text_editor::Content::with_text(text.as_ref());
+    /// 更新详情区只读文本（Arc 赋值，几乎零开销）
+    pub fn set_detail_text(&mut self, text: impl Into<String>) {
+        self.detail_text = Arc::new(text.into());
         self.detail_loading = false;
     }
 
     /// 详情区进入后台加载态
-    pub fn begin_detail_loading(&mut self, placeholder: impl AsRef<str>) {
-        self.detail_content = text_editor::Content::with_text(placeholder.as_ref());
+    pub fn begin_detail_loading(&mut self, placeholder: impl Into<String>) {
+        self.detail_text = Arc::new(placeholder.into());
         self.detail_loading = true;
     }
 
     /// 清理详情区内容
     pub fn clear_detail(&mut self) {
-        self.detail_content = text_editor::Content::new();
+        self.detail_text = Arc::new(String::new());
         self.detail_loading = false;
     }
 
@@ -171,27 +171,21 @@ impl TableState {
         self.error_message = None;
     }
 
-    /// 应用全分区搜索结果
+    /// 应用全分区搜索结果（接受已是 MessageSummary 的列表）
     pub fn apply_search_results(
         &mut self,
-        decoded_results: Vec<DecodedMessage>,
+        mut results: Vec<MessageSummary>,
         scanned_messages: usize,
         low_watermark: i64,
         high_watermark: i64,
         load_time_ms: u128,
     ) {
-        let mut results: Vec<MessageSummary> = decoded_results
-            .into_iter()
-            .map(|msg| msg.into_summary(""))
-            .collect();
         sort_summaries(&mut results, self.sort_order);
-        self.search_results = Some(results);
+        let total = results.len() as i64;
+        self.search_results = Some(Arc::new(results));
         self.search_scanned_messages = Some(scanned_messages);
         self.current_page = 0;
-        self.total_messages = self
-            .search_results
-            .as_ref()
-            .map_or(0, |items| items.len() as i64);
+        self.total_messages = total;
         self.low_watermark = low_watermark;
         self.high_watermark = high_watermark;
         self.loading = false;
@@ -235,8 +229,11 @@ impl TableState {
         self.selected_index = None;
         self.clear_detail();
 
-        if let Some(results) = self.search_results.as_mut() {
-            sort_summaries(results, order);
+        if let Some(arc_results) = self.search_results.take() {
+            let mut results = Arc::try_unwrap(arc_results)
+                .unwrap_or_else(|arc| (*arc).clone());
+            sort_summaries(&mut results, order);
+            self.search_results = Some(Arc::new(results));
             self.apply_search_page();
         }
 
@@ -267,20 +264,22 @@ mod tests {
     use chrono::TimeZone;
 
     use super::TableState;
-    use crate::kafka::types::{DecodedMessage, DecodedPayload, KafkaMessage, SortOrder};
+    use crate::kafka::types::{MessageSummary, SortOrder};
 
-    fn sample_message(offset: i64) -> DecodedMessage {
-        DecodedMessage {
-            raw: KafkaMessage {
-                topic: "orders".to_string(),
-                partition: 0,
-                offset,
-                timestamp: Some(chrono::Utc.with_ymd_and_hms(2026, 3, 19, 10, 0, 0).unwrap()),
-                key: None,
-                payload: None,
-            },
-            decoded_key: Some(format!("order-{offset}")),
-            decoded_value: DecodedPayload::Text(format!("value-{offset}")),
+    fn sample_summary(offset: i64) -> MessageSummary {
+        MessageSummary {
+            topic: "orders".to_string(),
+            partition: 0,
+            offset,
+            timestamp: Some(chrono::Utc.with_ymd_and_hms(2026, 3, 19, 10, 0, 0).unwrap()),
+            payload_size: 10,
+            key_preview: Some(format!("order-{offset}")),
+            value_format: "Text",
+            partition_label: "P-0".to_string(),
+            offset_label: offset.to_string(),
+            ts_label: "03-19 10:00:00".to_string(),
+            key_label: format!("order-{offset}"),
+            value_label: format!("value-{offset}"),
         }
     }
 
@@ -327,7 +326,7 @@ mod tests {
 
         state.begin_partition_search();
         state.apply_search_results(
-            vec![sample_message(1), sample_message(2), sample_message(3)],
+            vec![sample_summary(1), sample_summary(2), sample_summary(3)],
             12,
             0,
             12,
@@ -355,7 +354,7 @@ mod tests {
         let mut state = TableState::default();
 
         state.apply_search_results(
-            vec![sample_message(1), sample_message(3), sample_message(2)],
+            vec![sample_summary(1), sample_summary(3), sample_summary(2)],
             3,
             0,
             3,

@@ -178,6 +178,14 @@ mod tests {
     }
 
     #[test]
+    fn test_decoded_payload_summary_with_unicode() {
+        let payload = DecodedPayload::Text("中文摘要内容".to_string());
+        let summary = payload.summary(4);
+
+        assert_eq!(summary, "中文摘要...");
+    }
+
+    #[test]
     fn test_decoded_payload_format_name() {
         assert_eq!(
             DecodedPayload::Json(serde_json::Value::Null).format_name(),

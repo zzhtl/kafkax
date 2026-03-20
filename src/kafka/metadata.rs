@@ -1,11 +1,11 @@
 use anyhow::Result;
+use rdkafka::consumer::BaseConsumer;
 use rdkafka::consumer::Consumer;
-use rdkafka::consumer::StreamConsumer;
 
 use crate::kafka::types::{PartitionMeta, TopicMeta};
 
 /// 从 Kafka 集群拉取 topic/partition 元数据
-pub fn fetch_metadata(consumer: &StreamConsumer) -> Result<Vec<TopicMeta>> {
+pub fn fetch_metadata(consumer: &BaseConsumer) -> Result<Vec<TopicMeta>> {
     let metadata = consumer.fetch_metadata(None, std::time::Duration::from_secs(10))?;
 
     let topics: Vec<TopicMeta> = metadata
@@ -32,7 +32,7 @@ pub fn fetch_metadata(consumer: &StreamConsumer) -> Result<Vec<TopicMeta>> {
 
 /// 获取指定 partition 的 watermark（low, high offset）
 pub fn fetch_watermarks(
-    consumer: &StreamConsumer,
+    consumer: &BaseConsumer,
     topic: &str,
     partition: i32,
 ) -> Result<(i64, i64)> {
