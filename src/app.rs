@@ -479,6 +479,10 @@ impl App {
                 }
             }
             Message::Search => self.begin_topic_search(),
+            Message::SetSearchAllPartitions(v) => {
+                self.state.table.search_all_partitions = v;
+                Task::none()
+            }
 
             // --- 窗口 ---
             Message::WindowOpened(id) => {
@@ -502,7 +506,11 @@ impl App {
             self.state.saved_connections.len(),
         );
 
-        let toolbar = ui::toolbar::view(&self.state.table, self.state.decoder.selected);
+        let toolbar = ui::toolbar::view(
+            &self.state.table,
+            self.state.decoder.selected,
+            self.state.sidebar.selected_partition,
+        );
         let table = ui::message_table::view(&self.state.table);
         let detail = ui::message_detail::view(&self.state.table);
 
@@ -631,19 +639,29 @@ impl App {
             return Task::none();
         }
 
-        let Some((topic, partitions)) = self.selected_topic_partitions() else {
+        let Some((topic, all_partitions)) = self.selected_topic_partitions() else {
             self.state.notice = Some(AppNotice::info(
                 "请先从左侧选择一个 Topic 对应的 Partition，再执行搜索",
             ));
             return Task::none();
         };
 
-        if partitions.is_empty() {
+        if all_partitions.is_empty() {
             self.state.notice = Some(AppNotice::error(format!(
                 "Topic {topic} 没有可搜索的 Partition"
             )));
             return Task::none();
         }
+
+        // 根据开关和侧边栏选中状态决定实际搜索的分区列表
+        let partitions = if self.state.table.search_all_partitions {
+            all_partitions
+        } else {
+            match self.state.sidebar.selected_partition {
+                Some(p) => vec![p],    // 选中了具体分区，只搜该分区
+                None => all_partitions, // 只选了 topic，搜全部
+            }
+        };
 
         self.invalidate_page_requests();
         self.state.table.begin_partition_search();

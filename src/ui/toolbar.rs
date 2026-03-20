@@ -1,4 +1,4 @@
-use iced::widget::{Space, button, container, row, text, text_input};
+use iced::widget::{Space, button, checkbox, container, row, text, text_input};
 use iced::{Background, Border, Color, Element, Length, Theme};
 
 use crate::codec::DecoderType;
@@ -7,19 +7,34 @@ use crate::state::TableState;
 use crate::theme::AppColors;
 
 /// 渲染工具栏
-pub fn view<'a>(table: &'a TableState, selected_decoder: DecoderType) -> Element<'a, Message> {
-    let search_placeholder = if table.has_search_results() || table.search_in_progress {
-        "正在显示全分区搜索结果"
+pub fn view<'a>(
+    table: &'a TableState,
+    selected_decoder: DecoderType,
+    selected_partition: Option<i32>,
+) -> Element<'a, Message> {
+    let placeholder = if table.has_search_results() || table.search_in_progress {
+        "正在显示搜索结果".to_string()
+    } else if !table.search_all_partitions {
+        match selected_partition {
+            Some(p) => format!("输入关键词后回车搜索 Partition {p}"),
+            None => "输入关键词后回车搜索全部分区".to_string(),
+        }
     } else {
-        "输入关键词后回车搜索当前 Topic 全部分区"
+        "输入关键词后回车搜索全部分区".to_string()
     };
 
-    let search_input = text_input(search_placeholder, &table.search_query)
+    let search_input = text_input(&placeholder, &table.search_query)
         .on_input(Message::SearchInputChanged)
         .on_submit(Message::Search)
         .padding([8, 10])
         .size(14)
         .width(320);
+
+    let all_partitions_toggle = checkbox(table.search_all_partitions)
+        .label("全分区")
+        .on_toggle(Message::SetSearchAllPartitions)
+        .size(14)
+        .text_size(13);
 
     // 解码器选择按钮组
     let decoder_row = DecoderType::ALL.iter().fold(row![].spacing(4), |r, &dt| {
@@ -131,6 +146,7 @@ pub fn view<'a>(table: &'a TableState, selected_decoder: DecoderType) -> Element
 
     let toolbar = row![
         search_input,
+        all_partitions_toggle,
         decoder_section,
         Space::new().width(Length::Fill),
         page_controls,

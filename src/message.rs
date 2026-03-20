@@ -102,6 +102,8 @@ pub enum Message {
     SearchInputChanged(String),
     /// 执行搜索
     Search,
+    /// 设置"全分区搜索"开关（直接传目标值，避免多次触发竞态）
+    SetSearchAllPartitions(bool),
 
     // --- 其他 ---
     /// 主窗口已打开

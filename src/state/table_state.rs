@@ -33,6 +33,8 @@ pub struct TableState {
     pub detail_loading: bool,
     /// 搜索关键词
     pub search_query: String,
+    /// 是否强制搜索全部分区（false = 智能：选 partition 只搜该分区，选 topic 搜全部）
+    pub search_all_partitions: bool,
     /// 是否正在加载
     pub loading: bool,
     /// 当前是否在执行全分区搜索
@@ -60,6 +62,7 @@ impl Default for TableState {
             detail_text: Arc::new(String::new()),
             detail_loading: false,
             search_query: String::new(),
+            search_all_partitions: false,
             loading: false,
             search_in_progress: false,
             load_time_ms: None,
