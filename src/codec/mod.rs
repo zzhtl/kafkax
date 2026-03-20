@@ -5,7 +5,7 @@ pub mod msgpack;
 pub mod plugin;
 pub mod protobuf;
 
-use crate::kafka::types::{DecodedMessage, DecodedPayload, KafkaMessage};
+use crate::kafka::types::{DecodedMessage, DecodedPayload, KafkaMessage, MessageSummary};
 
 /// 解码器类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +77,12 @@ impl DecoderPipeline {
             decoded_key,
             decoded_value,
         }
+    }
+
+    /// 解码并直接生成摘要，不保留原始字节和完整 JSON Value
+    /// 适用于搜索场景，避免在内存中堆积大对象
+    pub fn decode_to_summary(&self, msg: KafkaMessage, query: &str) -> MessageSummary {
+        self.decode(msg).into_summary(query)
     }
 
     /// 批量解码
