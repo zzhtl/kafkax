@@ -10,8 +10,10 @@ use rdkafka::consumer::{BaseConsumer, Consumer};
 use crate::codec::DecoderPipeline;
 use crate::config::ConnectionConfig;
 use crate::kafka::connection;
+use rayon::prelude::*;
+
 use crate::kafka::types::{
-    KafkaMessage, MessageSummary, OffsetRange, PageData, SearchResult, SortOrder,
+    KafkaMessage, MessageSummary, OffsetRange, PageData, ScanLimits, SearchResult, SortOrder,
     sort_search_matches,
 };
 
@@ -69,16 +71,14 @@ pub fn fetch_page(
         }
     }
 
-    // 批量解码
-    let mut decoded = decoder.decode_batch(raw_messages);
-    sort_search_matches(&mut decoded, sort_order);
+    // 批量解码为摘要（不保留原始字节）
+    let mut summaries: Vec<MessageSummary> = raw_messages
+        .into_iter()
+        .map(|msg| decoder.decode_to_summary(msg, ""))
+        .collect();
+    crate::kafka::types::sort_summaries(&mut summaries, sort_order);
 
     let total = high - low;
-
-    let summaries: Vec<MessageSummary> = decoded
-        .into_iter()
-        .map(|msg| msg.into_summary(""))
-        .collect();
 
     Ok(PageData {
         messages: summaries,
@@ -159,6 +159,90 @@ pub fn search_partition(
         low_watermark: low,
         high_watermark: high,
     })
+}
+
+/// 搜索单个分区，返回轻量摘要，支持双重扫描限制
+/// 返回：(命中摘要列表, 本分区扫描数, 本分区字节数, 是否因超限停止)
+pub fn search_partition_summarized(
+    connection_config: &ConnectionConfig,
+    topic: &str,
+    partition: i32,
+    query: &str,
+    decoder: &DecoderPipeline,
+    limits: &ScanLimits,
+) -> Result<(Vec<MessageSummary>, usize, usize, bool)> {
+    let consumer = connection::create_consumer(connection_config)?;
+    let (low, high) = consumer.fetch_watermarks(topic, partition, Duration::from_secs(5))?;
+
+    if high <= low {
+        return Ok((Vec::new(), 0, 0, false));
+    }
+
+    let mut simple_consumer = SimplePartitionConsumer::start(&consumer, topic, partition, low)?;
+
+    let mut local_scanned = 0usize;
+    let mut local_bytes = 0usize;
+    let mut matches = Vec::new();
+    let mut timeout_streak = 0usize;
+    let final_offset = high.saturating_sub(1);
+    let mut last_offset = low.saturating_sub(1);
+    let mut stopped_early = false;
+
+    while last_offset < final_offset {
+        match simple_consumer.poll(Duration::from_secs(2))? {
+            SimplePoll::Message(kafka_message) => {
+                timeout_streak = 0;
+                last_offset = kafka_message.offset;
+                let payload_size = kafka_message.payload.as_ref().map_or(0, |p| p.len());
+
+                // 先用原始 DecodedMessage 判断是否命中（保证不漏报）
+                let decoded = decoder.decode(kafka_message);
+                let is_match = decoded.matches_query(query);
+
+                // 检查全局限制（无论是否命中都计入扫描量）
+                if !limits.record(payload_size) {
+                    if is_match {
+                        matches.push(decoded.into_summary(query));
+                    }
+                    stopped_early = true;
+                    break;
+                }
+
+                local_scanned += 1;
+                local_bytes += payload_size;
+
+                if is_match {
+                    matches.push(decoded.into_summary(query));
+                }
+            }
+            SimplePoll::PartitionEof => break,
+            SimplePoll::Timeout => {
+                timeout_streak += 1;
+                if timeout_streak >= 5 {
+                    anyhow::bail!(
+                        "扫描分区超时，已读到 offset {}，目标结束 offset {}",
+                        last_offset,
+                        final_offset
+                    );
+                }
+            }
+        }
+    }
+
+    Ok((matches, local_scanned, local_bytes, stopped_early))
+}
+
+/// 判断摘要是否匹配搜索词
+#[allow(unused)]
+fn summary_matches_query(summary: &MessageSummary, query: &str) -> bool {
+    let query = query.trim();
+    if query.is_empty() {
+        return true;
+    }
+    let query_lower = query.to_lowercase();
+    summary.key_label.to_lowercase().contains(&query_lower)
+        || summary.value_label.to_lowercase().contains(&query_lower)
+        || summary.offset_label.contains(query)
 }
 
 enum SimplePoll {
@@ -382,6 +466,25 @@ pub fn search_topic(
             high_watermark
         },
     })
+}
+
+/// 并行搜索 topic 所有分区，返回每个分区的独立结果（rayon 并行）
+pub fn search_topic_parallel(
+    connection_config: &ConnectionConfig,
+    topic: &str,
+    partitions: &[i32],
+    query: &str,
+    decoder: &DecoderPipeline,
+    limits: &ScanLimits,
+) -> Result<Vec<(Vec<MessageSummary>, usize, usize, bool)>> {
+    let results: Vec<Result<(Vec<MessageSummary>, usize, usize, bool)>> = partitions
+        .par_iter()
+        .map(|&partition| {
+            search_partition_summarized(connection_config, topic, partition, query, decoder, limits)
+        })
+        .collect();
+
+    results.into_iter().collect()
 }
 
 /// 拉取单条消息并返回其 JSON 字符串表示（用于详情展示/复制）
