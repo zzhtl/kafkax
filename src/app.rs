@@ -17,6 +17,7 @@ use kafkax::kafka;
 use kafkax::kafka::types::{MessageSummary, ScanLimits};
 use kafkax::message::Message;
 use kafkax::state::{AppNotice, AppState, ConnectionStatus};
+use kafkax::state::overlay_state::OverlayState;
 use kafkax::theme;
 use kafkax::ui;
 
@@ -494,14 +495,18 @@ impl App {
             // --- 键盘快捷键 ---
             Message::KeyPressed(key, modifiers) => self.handle_key(key, modifiers),
 
-            // --- 右键菜单（Task 9 实现）---
+            // --- 右键菜单 ---
             Message::CursorMoved(x, y) => {
                 self.state.cursor_pos = (x, y);
                 Task::none()
             }
-            Message::ShowContextMenu { .. } => Task::none(),
+            Message::ShowContextMenu { target } => {
+                let (x, y) = self.state.cursor_pos;
+                self.state.overlay = OverlayState::ContextMenu { x, y, target };
+                Task::none()
+            }
             Message::CloseOverlay => {
-                self.state.overlay = kafkax::state::overlay_state::OverlayState::None;
+                self.state.overlay = OverlayState::None;
                 Task::none()
             }
             Message::WindowResized(w, h) => {
@@ -509,22 +514,343 @@ impl App {
                 Task::none()
             }
 
-            // --- 发送消息（Task 9 实现）---
-            Message::OpenSendMessage { .. } => Task::none(),
-            Message::SendMessageInputChanged(_) => Task::none(),
-            Message::SendMessages => Task::none(),
-            Message::MessagesSent(_) => Task::none(),
+            // --- 发送消息 ---
+            Message::OpenSendMessage { topic, partition } => {
+                self.state.overlay = OverlayState::SendMessage {
+                    topic,
+                    partition,
+                    input: String::new(),
+                    sending: false,
+                    error: None,
+                };
+                Task::none()
+            }
+            Message::SendMessageInputChanged(input) => {
+                if let OverlayState::SendMessage {
+                    input: ref mut i,
+                    error: ref mut e,
+                    ..
+                } = self.state.overlay
+                {
+                    *i = input;
+                    *e = None;
+                }
+                Task::none()
+            }
+            Message::SendMessages => {
+                if self.consumer.is_none() {
+                    self.state.notice =
+                        Some(AppNotice::info("请先连接 Kafka 再发送消息"));
+                    return Task::none();
+                }
+                let (topic, partition, input) = match &self.state.overlay {
+                    OverlayState::SendMessage {
+                        topic,
+                        partition,
+                        input,
+                        ..
+                    } => (topic.clone(), *partition, input.clone()),
+                    _ => return Task::none(),
+                };
 
-            // --- Topic 配置（Task 9 实现）---
-            Message::OpenTopicConfig { .. } => Task::none(),
-            Message::TopicConfigLoaded(_) => Task::none(),
-            Message::TopicConfigRetentionSecsChanged(_) => Task::none(),
-            Message::TopicConfigRetentionGbChanged(_) => Task::none(),
-            Message::SaveTopicConfig => Task::none(),
-            Message::TopicConfigSaved(_) => Task::none(),
-            Message::RequestPurgeTopicData => Task::none(),
-            Message::ConfirmPurgeTopicData => Task::none(),
-            Message::TopicDataPurged(_) => Task::none(),
+                let payloads =
+                    match kafkax::kafka::producer::parse_json_to_payloads(&input) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            if let OverlayState::SendMessage {
+                                error, sending, ..
+                            } = &mut self.state.overlay
+                            {
+                                *error = Some(e.to_string());
+                                *sending = false;
+                            }
+                            return Task::none();
+                        }
+                    };
+
+                if let OverlayState::SendMessage {
+                    sending, error, ..
+                } = &mut self.state.overlay
+                {
+                    *sending = true;
+                    *error = None;
+                }
+
+                let config = self.state.connection_config.clone();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            kafkax::kafka::producer::send_messages(
+                                config, topic, partition, payloads,
+                            )
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(anyhow::anyhow!("任务异常: {e}")))
+                        .map_err(|e| e.to_string())
+                    },
+                    Message::MessagesSent,
+                )
+            }
+            Message::MessagesSent(result) => {
+                match result {
+                    Ok(count) => {
+                        let msg = if let OverlayState::SendMessage {
+                            topic, partition, ..
+                        } = &self.state.overlay
+                        {
+                            format!(
+                                "成功发送 {} 条消息到 {}/P-{}",
+                                count, topic, partition
+                            )
+                        } else {
+                            format!("成功发送 {} 条消息", count)
+                        };
+                        self.state.overlay = OverlayState::None;
+                        self.state.notice = Some(AppNotice::success(msg));
+                    }
+                    Err(e) => {
+                        if let OverlayState::SendMessage {
+                            sending, error, ..
+                        } = &mut self.state.overlay
+                        {
+                            *sending = false;
+                            *error = Some(e);
+                        }
+                    }
+                }
+                Task::none()
+            }
+
+            // --- Topic 配置 ---
+            Message::OpenTopicConfig { topic, partitions } => {
+                if self.consumer.is_none() {
+                    self.state.notice =
+                        Some(AppNotice::info("请先连接 Kafka 再修改配置"));
+                    return Task::none();
+                }
+                self.state.overlay = OverlayState::TopicConfig {
+                    topic: topic.clone(),
+                    partitions: partitions.clone(),
+                    retention_secs: String::new(),
+                    retention_gb: String::new(),
+                    retention_gb_note: None,
+                    loading: true,
+                    saving: false,
+                    error: None,
+                    purge_confirm_pending: false,
+                    purging: false,
+                };
+                let config = self.state.connection_config.clone();
+                Task::perform(
+                    async move {
+                        kafkax::kafka::admin::describe_topic_config(config, topic)
+                            .await
+                            .map_err(|e| e.to_string())
+                    },
+                    Message::TopicConfigLoaded,
+                )
+            }
+            Message::TopicConfigLoaded(result) => {
+                if let OverlayState::TopicConfig {
+                    retention_secs,
+                    retention_gb,
+                    retention_gb_note,
+                    loading,
+                    error,
+                    ..
+                } = &mut self.state.overlay
+                {
+                    *loading = false;
+                    match result {
+                        Ok((secs, gb, note)) => {
+                            *retention_secs = secs;
+                            *retention_gb = gb;
+                            *retention_gb_note = note;
+                            *error = None;
+                        }
+                        Err(e) => {
+                            *error = Some(format!("加载配置失败: {}", e));
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::TopicConfigRetentionSecsChanged(val) => {
+                if let OverlayState::TopicConfig {
+                    retention_secs, ..
+                } = &mut self.state.overlay
+                {
+                    *retention_secs = val;
+                }
+                Task::none()
+            }
+            Message::TopicConfigRetentionGbChanged(val) => {
+                if let OverlayState::TopicConfig {
+                    retention_gb, ..
+                } = &mut self.state.overlay
+                {
+                    *retention_gb = val;
+                }
+                Task::none()
+            }
+            Message::SaveTopicConfig => {
+                let (topic, secs_str, gb_str) = match &self.state.overlay {
+                    OverlayState::TopicConfig {
+                        topic,
+                        retention_secs,
+                        retention_gb,
+                        ..
+                    } => (topic.clone(), retention_secs.clone(), retention_gb.clone()),
+                    _ => return Task::none(),
+                };
+
+                let retention_ms =
+                    match kafkax::state::overlay_state::secs_to_ms(&secs_str) {
+                        Some(v) => v,
+                        None => {
+                            if let OverlayState::TopicConfig { error, .. } =
+                                &mut self.state.overlay
+                            {
+                                *error =
+                                    Some("保留时间格式无效".to_string());
+                            }
+                            return Task::none();
+                        }
+                    };
+                let retention_bytes =
+                    match kafkax::state::overlay_state::gb_to_bytes(&gb_str) {
+                        Some(v) => v,
+                        None => {
+                            if let OverlayState::TopicConfig { error, .. } =
+                                &mut self.state.overlay
+                            {
+                                *error = Some(
+                                    "磁盘占用格式无效或超出范围".to_string(),
+                                );
+                            }
+                            return Task::none();
+                        }
+                    };
+
+                if let OverlayState::TopicConfig {
+                    saving,
+                    purge_confirm_pending,
+                    ..
+                } = &mut self.state.overlay
+                {
+                    *saving = true;
+                    *purge_confirm_pending = false;
+                }
+
+                let config = self.state.connection_config.clone();
+                Task::perform(
+                    async move {
+                        kafkax::kafka::admin::alter_topic_config(
+                            config,
+                            topic,
+                            retention_ms,
+                            retention_bytes,
+                        )
+                        .await
+                        .map_err(|e| e.to_string())
+                    },
+                    Message::TopicConfigSaved,
+                )
+            }
+            Message::TopicConfigSaved(result) => {
+                match result {
+                    Ok(()) => {
+                        let topic = match &self.state.overlay {
+                            OverlayState::TopicConfig { topic, .. } => {
+                                topic.clone()
+                            }
+                            _ => String::new(),
+                        };
+                        self.state.overlay = OverlayState::None;
+                        self.state.notice = Some(AppNotice::success(format!(
+                            "已更新 {} 配置",
+                            topic
+                        )));
+                    }
+                    Err(e) => {
+                        if let OverlayState::TopicConfig {
+                            saving, error, ..
+                        } = &mut self.state.overlay
+                        {
+                            *saving = false;
+                            *error = Some(e);
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::RequestPurgeTopicData => {
+                if let OverlayState::TopicConfig {
+                    purge_confirm_pending,
+                    ..
+                } = &mut self.state.overlay
+                {
+                    *purge_confirm_pending = true;
+                }
+                Task::none()
+            }
+            Message::ConfirmPurgeTopicData => {
+                let (topic, partitions) = match &self.state.overlay {
+                    OverlayState::TopicConfig {
+                        topic, partitions, ..
+                    } => (topic.clone(), partitions.clone()),
+                    _ => return Task::none(),
+                };
+
+                if let OverlayState::TopicConfig {
+                    purge_confirm_pending,
+                    purging,
+                    ..
+                } = &mut self.state.overlay
+                {
+                    *purge_confirm_pending = false;
+                    *purging = true;
+                }
+
+                let config = self.state.connection_config.clone();
+                Task::perform(
+                    async move {
+                        kafkax::kafka::admin::purge_topic(
+                            config, topic, partitions,
+                        )
+                        .await
+                        .map_err(|e| e.to_string())
+                    },
+                    Message::TopicDataPurged,
+                )
+            }
+            Message::TopicDataPurged(result) => {
+                match result {
+                    Ok(()) => {
+                        let topic = match &self.state.overlay {
+                            OverlayState::TopicConfig { topic, .. } => {
+                                topic.clone()
+                            }
+                            _ => String::new(),
+                        };
+                        self.state.overlay = OverlayState::None;
+                        self.state.notice = Some(AppNotice::success(format!(
+                            "已清空 {} 的全部数据",
+                            topic
+                        )));
+                    }
+                    Err(e) => {
+                        if let OverlayState::TopicConfig {
+                            purging, error, ..
+                        } = &mut self.state.overlay
+                        {
+                            *purging = false;
+                            *error = Some(e);
+                        }
+                    }
+                }
+                Task::none()
+            }
 
             Message::Noop => Task::none(),
         }
@@ -1154,6 +1480,11 @@ impl App {
         match key {
             // Escape - 关闭对话框 / 取消选中
             Key::Named(Named::Escape) => {
+                // 先尝试关闭 overlay
+                if !matches!(self.state.overlay, OverlayState::None) {
+                    self.state.overlay = OverlayState::None;
+                    return Task::none();
+                }
                 self.state.table.selected_index = None;
                 self.clear_detail_content();
                 Task::none()
