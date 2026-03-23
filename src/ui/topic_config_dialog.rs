@@ -7,6 +7,7 @@ use crate::state::overlay_state::is_valid_retention_input;
 use crate::theme::AppColors;
 
 /// 渲染 Topic 配置弹窗（居中显示）
+#[allow(clippy::too_many_arguments)]
 pub fn view<'a>(
     topic: &'a str,
     retention_secs: &'a str,
