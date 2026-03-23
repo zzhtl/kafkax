@@ -1,7 +1,8 @@
-use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
+use iced::widget::{Space, button, column, container, mouse_area, row, scrollable, text, text_input};
 use iced::{Background, Border, Color, Element, Length, Theme};
 
 use crate::message::Message;
+use crate::state::overlay_state::ContextMenuTarget;
 use crate::state::{ConnectionStatus, SidebarState};
 use crate::theme::AppColors;
 
@@ -63,7 +64,20 @@ pub fn view<'a>(
             .padding([6, 10])
             .width(Length::Fill);
 
-            content = content.push(topic_btn);
+            let partition_ids: Vec<i32> = topic.partitions.iter().map(|p| p.id).collect();
+            let topic_name2 = topic.name.clone();
+            let partition_ids2 = partition_ids.clone();
+
+            let topic_with_mouse = mouse_area(topic_btn)
+                .on_move(move |point| Message::CursorMoved(point.x, point.y))
+                .on_right_press(Message::ShowContextMenu {
+                    target: ContextMenuTarget::Topic {
+                        name: topic_name2,
+                        partitions: partition_ids2,
+                    },
+                });
+
+            content = content.push(topic_with_mouse);
 
             if is_expanded {
                 for part in &topic.partitions {
@@ -102,7 +116,19 @@ pub fn view<'a>(
                     .padding([5, 10])
                     .width(Length::Fill);
 
-                    content = content.push(part_btn);
+                    let part_topic2 = topic.name.clone();
+                    let part_id = part.id;
+
+                    let part_with_mouse = mouse_area(part_btn)
+                        .on_move(move |point| Message::CursorMoved(point.x, point.y))
+                        .on_right_press(Message::ShowContextMenu {
+                            target: ContextMenuTarget::Partition {
+                                topic: part_topic2,
+                                partition: part_id,
+                            },
+                        });
+
+                    content = content.push(part_with_mouse);
                 }
             }
         }
