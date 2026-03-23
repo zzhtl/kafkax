@@ -494,6 +494,38 @@ impl App {
             // --- 键盘快捷键 ---
             Message::KeyPressed(key, modifiers) => self.handle_key(key, modifiers),
 
+            // --- 右键菜单（Task 9 实现）---
+            Message::CursorMoved(x, y) => {
+                self.state.cursor_pos = (x, y);
+                Task::none()
+            }
+            Message::ShowContextMenu { .. } => Task::none(),
+            Message::CloseOverlay => {
+                self.state.overlay = kafkax::state::overlay_state::OverlayState::None;
+                Task::none()
+            }
+            Message::WindowResized(w, h) => {
+                self.state.window_size = (w, h);
+                Task::none()
+            }
+
+            // --- 发送消息（Task 9 实现）---
+            Message::OpenSendMessage { .. } => Task::none(),
+            Message::SendMessageInputChanged(_) => Task::none(),
+            Message::SendMessages => Task::none(),
+            Message::MessagesSent(_) => Task::none(),
+
+            // --- Topic 配置（Task 9 实现）---
+            Message::OpenTopicConfig { .. } => Task::none(),
+            Message::TopicConfigLoaded(_) => Task::none(),
+            Message::TopicConfigRetentionSecsChanged(_) => Task::none(),
+            Message::TopicConfigRetentionGbChanged(_) => Task::none(),
+            Message::SaveTopicConfig => Task::none(),
+            Message::TopicConfigSaved(_) => Task::none(),
+            Message::RequestPurgeTopicData => Task::none(),
+            Message::ConfirmPurgeTopicData => Task::none(),
+            Message::TopicDataPurged(_) => Task::none(),
+
             Message::Noop => Task::none(),
         }
     }

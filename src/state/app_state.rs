@@ -1,5 +1,6 @@
 use crate::codec::DecoderPipeline;
 use crate::config::ConnectionConfig;
+use crate::state::overlay_state::OverlayState;
 use crate::state::sidebar_state::SidebarState;
 use crate::state::table_state::TableState;
 
@@ -63,6 +64,9 @@ pub struct AppState {
     pub decoder: DecoderPipeline,
     pub show_connection_dialog: bool,
     pub notice: Option<AppNotice>,
+    pub overlay: OverlayState,
+    pub window_size: (f32, f32),
+    pub cursor_pos: (f32, f32),
 }
 
 impl Default for AppState {
@@ -78,6 +82,9 @@ impl Default for AppState {
             decoder: DecoderPipeline::default(),
             show_connection_dialog: true,
             notice: None,
+            overlay: OverlayState::None,
+            window_size: (1280.0, 800.0),
+            cursor_pos: (0.0, 0.0),
         }
     }
 }
