@@ -20,23 +20,20 @@ pub fn view<'a>(
 ) -> Element<'a, Message> {
     let items: Vec<(&str, Message)> = match target {
         ContextMenuTarget::Topic { name, partitions } => {
-            let n = name.clone();
-            let p = partitions.clone();
-            let n2 = n.clone();
-            let p2 = p.clone();
             vec![
                 (
                     "Topic 配置",
                     Message::OpenTopicConfig {
-                        topic: n,
-                        partitions: p,
+                        topic: name.clone(),
+                        partitions: partitions.clone(),
                     },
                 ),
+                // "清空数据" 直接打开 TopicConfig 弹窗，在弹窗内执行清空操作
                 (
                     "清空数据",
                     Message::OpenTopicConfig {
-                        topic: n2,
-                        partitions: p2,
+                        topic: name.clone(),
+                        partitions: partitions.clone(),
                     },
                 ),
                 ("关闭", Message::CloseOverlay),
