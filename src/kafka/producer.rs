@@ -80,6 +80,7 @@ fn build_producer_config(config: &ConnectionConfig) -> Result<ClientConfig> {
             .set("sasl.password", &sasl.password);
     }
 
+    #[allow(clippy::collapsible_if)]
     if matches!(
         config.security_protocol,
         SecurityProtocol::Ssl | SecurityProtocol::SaslSsl
@@ -129,5 +130,17 @@ mod tests {
     fn parse_empty_array_returns_zero_payloads() {
         let payloads = parse_json_to_payloads("[]").unwrap();
         assert_eq!(payloads.len(), 0);
+    }
+
+    #[test]
+    fn build_config_with_plain_text() {
+        use crate::config::{ConnectionConfig, SecurityProtocol};
+        let config = ConnectionConfig {
+            brokers: "localhost:9092".to_string(),
+            security_protocol: SecurityProtocol::Plaintext,
+            ..ConnectionConfig::default()
+        };
+        // 只验证不 panic，能成功创建 ClientConfig
+        assert!(build_producer_config(&config).is_ok());
     }
 }
