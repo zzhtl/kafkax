@@ -897,7 +897,7 @@ impl App {
             })
             .into();
 
-        // 连接对话框覆盖层
+        // 连接对话框覆盖层（优先级最高）
         if self.state.show_connection_dialog {
             let overlay = ui::connection_dialog::view(
                 &self.state.connection_draft,
@@ -906,10 +906,73 @@ impl App {
                 self.state.last_connection_name.as_deref(),
                 self.state.notice.as_ref(),
             );
-            iced::widget::stack![page, overlay].into()
-        } else {
-            page
+            return iced::widget::stack![page, overlay].into();
         }
+
+        // 右键菜单/弹窗 overlay
+        match &self.state.overlay {
+            OverlayState::None => page,
+
+            OverlayState::ContextMenu { x, y, target } => {
+                let backdrop = Self::overlay_backdrop();
+                let menu = ui::context_menu::view(*x, *y, target, self.state.window_size);
+                iced::widget::stack![page, backdrop, menu].into()
+            }
+
+            OverlayState::SendMessage { topic, partition, input, sending, error } => {
+                let backdrop = Self::overlay_backdrop();
+                let dialog = ui::send_message_dialog::view(
+                    topic,
+                    *partition,
+                    input,
+                    *sending,
+                    error.as_deref(),
+                );
+                iced::widget::stack![page, backdrop, dialog].into()
+            }
+
+            OverlayState::TopicConfig {
+                topic,
+                retention_secs,
+                retention_gb,
+                retention_gb_note,
+                loading,
+                saving,
+                purging,
+                purge_confirm_pending,
+                error,
+                ..
+            } => {
+                let backdrop = Self::overlay_backdrop();
+                let dialog = ui::topic_config_dialog::view(
+                    topic,
+                    retention_secs,
+                    retention_gb,
+                    retention_gb_note.as_deref(),
+                    *loading,
+                    *saving,
+                    *purging,
+                    *purge_confirm_pending,
+                    error.as_deref(),
+                );
+                iced::widget::stack![page, backdrop, dialog].into()
+            }
+        }
+    }
+
+    /// 全屏半透明遮罩，点击触发 CloseOverlay
+    fn overlay_backdrop() -> iced::widget::Button<'static, Message> {
+        use iced::widget::button;
+        use iced::{Background, Border, Color, Length};
+        button(iced::widget::Space::new().width(Length::Fill).height(Length::Fill))
+            .on_press(Message::CloseOverlay)
+            .style(|_theme, _status| button::Style {
+                background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.4))),
+                border: Border::default(),
+                ..Default::default()
+            })
+            .width(Length::Fill)
+            .height(Length::Fill)
     }
 
     /// 获取当前选中 partition 的当前页数据
@@ -1449,7 +1512,7 @@ impl App {
         })
     }
 
-    /// 键盘订阅
+    /// 键盘订阅 + 窗口尺寸订阅
     pub fn subscription(&self) -> Subscription<Message> {
         Subscription::batch([
             keyboard::listen().map(|event| match event {
@@ -1459,6 +1522,12 @@ impl App {
                 _ => Message::Noop,
             }),
             window::open_events().map(Message::WindowOpened),
+            window::events().map(|(_, event)| match event {
+                window::Event::Resized(iced::Size { width, height }) => {
+                    Message::WindowResized(width as f32, height as f32)
+                }
+                _ => Message::Noop,
+            }),
         ])
     }
 
