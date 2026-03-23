@@ -2,6 +2,7 @@ pub mod connection_dialog;
 pub mod context_menu;
 pub mod message_detail;
 pub mod message_table;
+pub mod send_message_dialog;
 pub mod sidebar;
 pub mod status_bar;
 pub mod syntax;
