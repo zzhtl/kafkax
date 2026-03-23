@@ -1524,7 +1524,7 @@ impl App {
             window::open_events().map(Message::WindowOpened),
             window::events().map(|(_, event)| match event {
                 window::Event::Resized(iced::Size { width, height }) => {
-                    Message::WindowResized(width as f32, height as f32)
+                    Message::WindowResized(width, height)
                 }
                 _ => Message::Noop,
             }),
