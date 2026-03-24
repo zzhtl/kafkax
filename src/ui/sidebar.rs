@@ -69,7 +69,6 @@ pub fn view<'a>(
             let partition_ids2 = partition_ids.clone();
 
             let topic_with_mouse = mouse_area(topic_btn)
-                .on_move(move |point| Message::CursorMoved(point.x, point.y))
                 .on_right_press(Message::ShowContextMenu {
                     target: ContextMenuTarget::Topic {
                         name: topic_name2,
@@ -120,7 +119,6 @@ pub fn view<'a>(
                     let part_id = part.id;
 
                     let part_with_mouse = mouse_area(part_btn)
-                        .on_move(move |point| Message::CursorMoved(point.x, point.y))
                         .on_right_press(Message::ShowContextMenu {
                             target: ContextMenuTarget::Partition {
                                 topic: part_topic2,

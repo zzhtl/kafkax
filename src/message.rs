@@ -119,8 +119,10 @@ pub enum Message {
     // --- 发送消息 ---
     /// 打开发送消息弹窗（从右键菜单触发）
     OpenSendMessage { topic: String, partition: i32 },
-    /// 输入框内容变化
-    SendMessageInputChanged(String),
+    /// 文本编辑器动作
+    SendMessageAction(iced::widget::text_editor::Action),
+    /// 格式化 JSON
+    FormatSendMessageJson,
     /// 执行发送
     SendMessages,
     /// 发送完成（后台回调）

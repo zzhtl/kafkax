@@ -26,6 +26,8 @@ pub struct App {
     pub state: AppState,
     /// Kafka consumer（Arc 用于在异步任务中共享）
     pub consumer: Option<Arc<BaseConsumer>>,
+    /// 发送消息弹窗的编辑器内容（Content 不实现 Clone，不能放进 OverlayState）
+    send_message_content: iced::widget::text_editor::Content,
     main_window_id: Option<window::Id>,
     page_request_id: u64,
     search_request_id: u64,
@@ -75,6 +77,7 @@ impl App {
         let app = Self {
             state,
             consumer: None,
+            send_message_content: iced::widget::text_editor::Content::default(),
             main_window_id: None,
             page_request_id: 0,
             search_request_id: 0,
@@ -516,6 +519,8 @@ impl App {
 
             // --- 发送消息 ---
             Message::OpenSendMessage { topic, partition } => {
+                self.send_message_content =
+                    iced::widget::text_editor::Content::default();
                 self.state.overlay = OverlayState::SendMessage {
                     topic,
                     partition,
@@ -525,15 +530,36 @@ impl App {
                 };
                 Task::none()
             }
-            Message::SendMessageInputChanged(input) => {
+            Message::SendMessageAction(action) => {
+                self.send_message_content.perform(action);
                 if let OverlayState::SendMessage {
                     input: ref mut i,
                     error: ref mut e,
                     ..
                 } = self.state.overlay
                 {
-                    *i = input;
+                    *i = self.send_message_content.text();
                     *e = None;
+                }
+                Task::none()
+            }
+            Message::FormatSendMessageJson => {
+                if let OverlayState::SendMessage { input, .. } = &self.state.overlay {
+                    let text = input.clone();
+                    if let Ok(value) =
+                        serde_json::from_str::<serde_json::Value>(&text)
+                    {
+                        if let Ok(pretty) = serde_json::to_string_pretty(&value) {
+                            self.send_message_content =
+                                iced::widget::text_editor::Content::with_text(&pretty);
+                            if let OverlayState::SendMessage { input, error, .. } =
+                                &mut self.state.overlay
+                            {
+                                *input = self.send_message_content.text();
+                                *error = None;
+                            }
+                        }
+                    }
                 }
                 Task::none()
             }
@@ -925,6 +951,7 @@ impl App {
                     topic,
                     *partition,
                     input,
+                    &self.send_message_content,
                     *sending,
                     error.as_deref(),
                 );
@@ -1527,6 +1554,12 @@ impl App {
                     Message::WindowResized(width, height)
                 }
                 _ => Message::Noop,
+            }),
+            iced::event::listen_with(|event, _, _| match event {
+                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
+                    Some(Message::CursorMoved(position.x, position.y))
+                }
+                _ => None,
             }),
         ])
     }
