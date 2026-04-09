@@ -16,6 +16,9 @@ fn main() -> iced::Result {
 
     tracing::info!("KafkaX 启动中...");
 
+    // 自动注册桌面入口和图标（仅 Linux）
+    kafkax::desktop::register_desktop_entry();
+
     iced::application(App::new, App::update, App::view)
         .title(App::title)
         .theme(App::theme)
